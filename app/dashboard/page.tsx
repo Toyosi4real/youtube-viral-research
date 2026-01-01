@@ -32,92 +32,6 @@ function fmt(n?: number) {
   return n.toLocaleString();
 }
 
-function clamp(n: number, a: number, b: number) {
-  return Math.max(a, Math.min(b, n));
-}
-
-function seededRandom(seed: number) {
-  // mulberry32
-  return function () {
-    seed |= 0;
-    seed = (seed + 0x6d2b79f5) | 0;
-    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-function weightedShuffle(items: any[], weights: Record<string, number>, seed: number) {
-  // Weights by channel country code; unknown -> OTHER
-  const byRegion: Record<string, any[]> = {};
-  for (const it of items) {
-    const r = (it.country || "OTHER").toUpperCase();
-    if (!byRegion[r]) byRegion[r] = [];
-    byRegion[r].push(it);
-  }
-
-  // shuffle inside each region
-  const rng = seededRandom(seed);
-  for (const k of Object.keys(byRegion)) {
-    const arr = byRegion[k];
-    for (let i = arr.length - 1; i > 0; i--) {
-      const j = Math.floor(rng() * (i + 1));
-      [arr[i], arr[j]] = [arr[j], arr[i]];
-    }
-  }
-
-  // build a weighted picker list
-  const regions = Object.keys(byRegion);
-  const w: Record<string, number> = {};
-  let total = 0;
-
-  for (const r of regions) {
-    const wt = clamp(Number(weights[r] ?? weights["OTHER"] ?? 1), 0, 1000);
-    if (wt <= 0 || byRegion[r].length === 0) continue;
-    w[r] = wt;
-    total += wt;
-  }
-
-  // if everything 0, just flatten
-  if (total <= 0) return items;
-
-  const out: any[] = [];
-  const remaining = () => regions.some((r) => (byRegion[r]?.length ?? 0) > 0);
-
-  while (remaining()) {
-    // pick region by weight
-    let roll = rng() * total;
-    let chosen: string | null = null;
-
-    for (const r of Object.keys(w)) {
-      roll -= w[r];
-      if (roll <= 0) {
-        chosen = r;
-        break;
-      }
-    }
-    chosen = chosen || Object.keys(w)[0];
-
-    // if chosen region empty, find next non-empty
-    if (!byRegion[chosen] || byRegion[chosen].length === 0) {
-      const alt = Object.keys(w).find((r) => (byRegion[r]?.length ?? 0) > 0);
-      if (!alt) break;
-      chosen = alt;
-    }
-
-    out.push(byRegion[chosen].shift());
-
-    // if a region empties, reduce total
-    if ((byRegion[chosen]?.length ?? 0) === 0) {
-      total -= w[chosen];
-      delete w[chosen];
-      if (total <= 0) break;
-    }
-  }
-
-  return out;
-}
-
 export default function DashboardPage() {
   const [tab, setTab] = useState<"discover" | "saved">("discover");
   const [userId, setUserId] = useState<string | null>(null);
@@ -140,15 +54,7 @@ export default function DashboardPage() {
 
   const [searchTitle, setSearchTitle] = useState("");
 
-  // region weighting sliders (0–100)
-  const [wUS, setWUS] = useState(100);
-  const [wGB, setWGB] = useState(70);
-  const [wCA, setWCA] = useState(70);
-  const [wAU, setWAU] = useState(70);
-  const [randomize, setRandomize] = useState(true);
-
-  // discover results
-  const [rawRows, setRawRows] = useState<any[]>([]);
+  // results
   const [rows, setRows] = useState<any[]>([]);
   const [hasSearched, setHasSearched] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -159,16 +65,6 @@ export default function DashboardPage() {
   const [savedRows, setSavedRows] = useState<any[]>([]);
   const [savedLoading, setSavedLoading] = useState(false);
   const [savedErr, setSavedErr] = useState<string | null>(null);
-
-  const weights = useMemo(() => {
-    return {
-      US: wUS,
-      GB: wGB,
-      CA: wCA,
-      AU: wAU,
-      OTHER: 10,
-    };
-  }, [wUS, wGB, wCA, wAU]);
 
   const qs = useMemo(() => {
     const p = new URLSearchParams();
@@ -212,7 +108,7 @@ export default function DashboardPage() {
       .select(`
         channel_id,
         channels:channel_id (
-          channel_id,title,country,subscriber_count,video_count,view_count,first_upload_at,
+          channel_id,title,subscriber_count,video_count,view_count,first_upload_at,
           channel_metrics (recent_days,recent_short_count,recent_avg_views,recent_total_views,ratio_views_per_sub,computed_at)
         )
       `)
@@ -261,20 +157,6 @@ export default function DashboardPage() {
     }
   }
 
-  function applyWeighting(list: any[]) {
-    // only shuffle if randomize is ON; otherwise keep backend order
-    if (!randomize) return list;
-
-    // seed: changes per refresh to make it "live"
-    const seed = Math.floor(Date.now() / 1000);
-    return weightedShuffle(list, weights, seed);
-  }
-
-  useEffect(() => {
-    setRows(applyWeighting(rawRows));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rawRows, weights, randomize]);
-
   async function applyFilters(refreshFirst: boolean) {
     setErr(null);
     setHasSearched(true);
@@ -285,11 +167,10 @@ export default function DashboardPage() {
       const res = await fetch(`/api/channels?${qs}${refreshParam}`, { cache: "no-store" });
       const j = await res.json();
       if (!j.ok) throw new Error(j.error || "Request failed");
-      setRawRows(j.results || []);
+      setRows(j.results || []);
       await loadSavedIds();
     } catch (e: any) {
       setErr(e.message);
-      setRawRows([]);
       setRows([]);
     } finally {
       setLoading(false);
@@ -308,13 +189,12 @@ export default function DashboardPage() {
 
   return (
     <main className="min-h-screen text-white overflow-hidden">
-      {/* Lively neon background */}
+      {/* Neon background */}
       <div className="fixed inset-0 -z-10 bg-[#05060a]">
         <div className="absolute inset-0 opacity-70 bg-[radial-gradient(ellipse_at_top,_rgba(34,255,170,0.22),_transparent_55%),radial-gradient(ellipse_at_bottom,_rgba(139,92,246,0.22),_transparent_55%)]" />
         <div className="absolute inset-0 opacity-20 bg-[linear-gradient(rgba(34,255,170,0.12)_1px,transparent_1px),linear-gradient(90deg,rgba(139,92,246,0.12)_1px,transparent_1px)] [background-size:60px_60px] animate-[gridmove_10s_linear_infinite]" />
         <div className="absolute -top-24 left-10 h-72 w-72 rounded-full bg-emerald-400/12 blur-3xl animate-[float_6s_ease-in-out_infinite]" />
         <div className="absolute top-32 right-14 h-80 w-80 rounded-full bg-violet-500/12 blur-3xl animate-[float_7s_ease-in-out_infinite]" />
-        <div className="absolute bottom-0 left-1/3 h-64 w-64 rounded-full bg-cyan-400/10 blur-3xl animate-[float_8s_ease-in-out_infinite]" />
         <style>{`
           @keyframes float { 0%,100%{ transform: translateY(0px)} 50%{ transform: translateY(18px)} }
           @keyframes gridmove { 0%{ transform: translateY(0)} 100%{ transform: translateY(60px)} }
@@ -330,9 +210,6 @@ export default function DashboardPage() {
             <div>
               <div className="text-lg font-semibold tracking-wide">
                 Kelvin YouTube Short Channel Finder
-              </div>
-              <div className="text-xs text-white/60">
-                US/GB/CA/AU • Shorts ≤ 60s • Recent AVG (14 days)
               </div>
             </div>
           </div>
@@ -376,9 +253,9 @@ export default function DashboardPage() {
             <div className="rounded-3xl border border-white/10 bg-white/5 backdrop-blur-md shadow-[0_0_60px_rgba(34,255,170,0.08)] overflow-hidden">
               <div className="px-6 py-5 border-b border-white/10 flex items-center justify-between">
                 <div>
-                  <div className="text-xl font-semibold">Filters + Region Weighting</div>
+                  <div className="text-xl font-semibold">Filters</div>
                   <div className="text-sm text-white/60">
-                    Weighting affects the mix of cards (client-side). Live Refresh pulls new YouTube data first.
+                    Results are channels that posted Shorts recently (no long videos recently).
                   </div>
                 </div>
 
@@ -398,7 +275,6 @@ export default function DashboardPage() {
                     className="rounded-2xl px-5 py-3 text-sm font-semibold
                                border border-emerald-400/25 bg-emerald-400/10 hover:bg-emerald-400/15 transition
                                shadow-[0_0_22px_rgba(34,255,170,0.14)]"
-                    title="Pull latest YouTube data, then apply filters"
                   >
                     {loading ? "Refreshing..." : "Live Refresh"}
                   </button>
@@ -409,8 +285,8 @@ export default function DashboardPage() {
                 <SelectBox title="PRIMARY SORT" value={primarySort} onChange={setPrimarySort} col="lg:col-span-3" />
                 <SelectBox title="SECONDARY SORT" value={secondarySort} onChange={setSecondarySort} col="lg:col-span-3" includeNone />
 
-                <CheckBoxCard title="Enhanced Only" desc="Requires Recent AVG + Ratio data" checked={enhancedOnly} onChange={setEnhancedOnly} col="lg:col-span-3" />
-                <CheckBoxCard title="Active Recently" desc="4+ shorts posted in last 14 days" checked={activeRecently} onChange={setActiveRecently} col="lg:col-span-3" />
+                <CheckBoxCard title="Enhanced Only" desc="Use Recent AVG + Ratio data" checked={enhancedOnly} onChange={setEnhancedOnly} col="lg:col-span-3" />
+                <CheckBoxCard title="Active Recently" desc="4+ Shorts in last 14 days" checked={activeRecently} onChange={setActiveRecently} col="lg:col-span-3" />
 
                 <RangeBox title="RECENT AVG RANGE" min={minRecentAvg} max={maxRecentAvg} setMin={setMinRecentAvg} setMax={setMaxRecentAvg} hint="0 → 5,000,000+" col="lg:col-span-4" />
                 <RangeBox title="SUBSCRIBERS RANGE" min={minSubs} max={maxSubs} setMin={setMinSubs} setMax={setMaxSubs} hint="0 → 5,000,000+" col="lg:col-span-4" />
@@ -418,49 +294,13 @@ export default function DashboardPage() {
 
                 <div className="lg:col-span-12 rounded-2xl border border-white/10 bg-black/20 p-4">
                   <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
-                    <div>
-                      <div className="text-sm font-semibold">Search Channel Titles</div>
-                      <div className="text-xs text-white/60">Optional. Filters your results after Apply.</div>
-                    </div>
+                    <div className="text-sm font-semibold">Search Channel Titles</div>
                     <input
                       value={searchTitle}
                       onChange={(e) => setSearchTitle(e.target.value)}
-                      placeholder="Search a niche… (e.g. fitness, ai, skincare)"
+                      placeholder="Search..."
                       className="w-full md:max-w-md rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-[rgba(34,255,170,0.55)]"
                     />
-                  </div>
-                </div>
-
-                {/* Region weighting */}
-                <div className="lg:col-span-12 rounded-2xl border border-white/10 bg-black/20 p-4">
-                  <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
-                    <div>
-                      <div className="text-sm font-semibold">Region Weighting (Mix Control)</div>
-                      <div className="text-xs text-white/60">
-                        Higher weight = more cards from that region (when country is available).
-                      </div>
-                    </div>
-
-                    <label className="flex items-center gap-2 text-sm border border-white/10 bg-white/5 px-3 py-2 rounded-xl">
-                      <input
-                        type="checkbox"
-                        checked={randomize}
-                        onChange={(e) => setRandomize(e.target.checked)}
-                        className="h-4 w-4 accent-emerald-400"
-                      />
-                      Randomize results
-                    </label>
-                  </div>
-
-                  <div className="mt-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-                    <Slider label="US" value={wUS} onChange={setWUS} />
-                    <Slider label="GB" value={wGB} onChange={setWGB} />
-                    <Slider label="CA" value={wCA} onChange={setWCA} />
-                    <Slider label="AU" value={wAU} onChange={setWAU} />
-                  </div>
-
-                  <div className="mt-3 text-xs text-white/50">
-                    Note: if many channels have no country set, they fall into OTHER and are shown less.
                   </div>
                 </div>
               </div>
@@ -469,12 +309,15 @@ export default function DashboardPage() {
             {/* Results */}
             <div className="mt-8">
               {!hasSearched ? (
-                <EmptyState />
+                <div className="rounded-3xl border border-white/10 bg-white/5 backdrop-blur-md p-10 text-center">
+                  <div className="mx-auto h-14 w-14 rounded-2xl bg-[radial-gradient(circle_at_30%_30%,rgba(34,255,170,0.85),rgba(139,92,246,0.65))] shadow-[0_0_30px_rgba(34,255,170,0.25)] animate-pulse" />
+                  <div className="mt-4 text-xl font-semibold">Apply Filters</div>
+                </div>
               ) : (
                 <div className="rounded-3xl border border-white/10 bg-white/5 backdrop-blur-md overflow-hidden">
                   <div className="px-6 py-4 border-b border-white/10 flex items-center justify-between">
                     <div>
-                      <div className="text-lg font-semibold">Discover Cards</div>
+                      <div className="text-lg font-semibold">Results</div>
                       <div className="text-xs text-white/60">
                         {loading ? "Loading…" : `${rows.length} channels`}
                       </div>
@@ -487,7 +330,7 @@ export default function DashboardPage() {
                       <CardSkeletonGrid />
                     ) : rows.length === 0 ? (
                       <div className="px-6 py-10 text-center text-white/60">
-                        No channels match your filters. If you want data immediately: click Live Refresh.
+                        No channels match your filters.
                       </div>
                     ) : (
                       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
@@ -495,7 +338,6 @@ export default function DashboardPage() {
                           const m = Array.isArray(r.channel_metrics) ? r.channel_metrics[0] : r.channel_metrics;
                           const ratio = typeof m?.ratio_views_per_sub === "number" ? m.ratio_views_per_sub : null;
                           const saved = savedIds.has(r.channel_id);
-
                           return (
                             <ChannelCard
                               key={r.channel_id}
@@ -510,10 +352,6 @@ export default function DashboardPage() {
                       </div>
                     )}
                   </div>
-
-                  <div className="px-6 py-4 text-xs text-white/50 border-t border-white/10">
-                    Cards animate + glow on hover. Use sliders to bias region mix.
-                  </div>
                 </div>
               )}
             </div>
@@ -525,14 +363,13 @@ export default function DashboardPage() {
               <div className="px-6 py-5 border-b border-white/10 flex items-center justify-between">
                 <div>
                   <div className="text-xl font-semibold">Saved Channels</div>
-                  <div className="text-sm text-white/60">Private to your account.</div>
                 </div>
 
                 <button
                   onClick={loadSavedList}
                   className="rounded-2xl px-5 py-3 text-sm font-semibold border border-white/10 bg-white/5 hover:bg-white/10 transition"
                 >
-                  Refresh Saved
+                  Refresh
                 </button>
               </div>
 
@@ -543,7 +380,7 @@ export default function DashboardPage() {
                   <CardSkeletonGrid />
                 ) : savedRows.length === 0 ? (
                   <div className="px-6 py-10 text-center text-white/60">
-                    No saved channels yet. Go to Discover and click “Save”.
+                    No saved channels.
                   </div>
                 ) : (
                   <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
@@ -568,10 +405,6 @@ export default function DashboardPage() {
                   </div>
                 )}
               </div>
-
-              <div className="px-6 py-4 text-xs text-white/50 border-t border-white/10">
-                Saved list is protected by Supabase RLS.
-              </div>
             </div>
           </>
         )}
@@ -579,8 +412,6 @@ export default function DashboardPage() {
     </main>
   );
 }
-
-/* ---------- UI Components ---------- */
 
 function SelectBox(props: {
   title: string;
@@ -595,23 +426,13 @@ function SelectBox(props: {
       <select
         value={props.value}
         onChange={(e) => props.onChange(e.target.value as SortKey)}
-        className="mt-2 w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-[rgba(34,255,170,0.55)] shadow-[0_0_18px_rgba(34,255,170,0.08)]"
+        className="mt-2 w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-[rgba(34,255,170,0.55)]"
       >
         {props.includeNone && <option value="none" className="bg-[#0b0d14]">No secondary sort</option>}
         {SORTS.map((s) => (
           <option key={s.value} value={s.value} className="bg-[#0b0d14]">{s.label}</option>
         ))}
       </select>
-    </div>
-  );
-}
-
-function EmptyState() {
-  return (
-    <div className="rounded-3xl border border-white/10 bg-white/5 backdrop-blur-md p-10 text-center">
-      <div className="mx-auto h-14 w-14 rounded-2xl bg-[radial-gradient(circle_at_30%_30%,rgba(34,255,170,0.85),rgba(139,92,246,0.65))] shadow-[0_0_30px_rgba(34,255,170,0.25)] animate-pulse" />
-      <div className="mt-4 text-xl font-semibold">Apply Filters to view channels</div>
-      <div className="mt-1 text-sm text-white/60">For fresh results, click Live Refresh.</div>
     </div>
   );
 }
@@ -678,35 +499,12 @@ function RangeBox(props: {
   );
 }
 
-function Slider(props: { label: string; value: number; onChange: (v: number) => void }) {
-  return (
-    <div className="rounded-2xl border border-white/10 bg-black/25 p-4">
-      <div className="flex items-center justify-between">
-        <div className="text-sm font-semibold">{props.label}</div>
-        <div className="text-xs text-white/60">{props.value}</div>
-      </div>
-      <input
-        type="range"
-        min={0}
-        max={100}
-        value={props.value}
-        onChange={(e) => props.onChange(Number(e.target.value))}
-        className="mt-3 w-full accent-emerald-400"
-      />
-      <div className="mt-1 text-[11px] text-white/50">0 = none • 100 = max</div>
-    </div>
-  );
-}
-
 function CardSkeletonGrid() {
   const items = Array.from({ length: 9 }, (_, i) => i);
   return (
     <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
       {items.map((i) => (
-        <div
-          key={i}
-          className="rounded-3xl border border-white/10 bg-white/5 p-5 overflow-hidden relative"
-        >
+        <div key={i} className="rounded-3xl border border-white/10 bg-white/5 p-5 overflow-hidden relative">
           <div className="absolute inset-0 opacity-35 bg-[linear-gradient(90deg,transparent,rgba(255,255,255,0.10),transparent)] [background-size:200%_100%] animate-[shimmer_1.2s_linear_infinite]" />
           <div className="h-4 w-2/3 bg-white/10 rounded" />
           <div className="mt-2 h-3 w-1/2 bg-white/10 rounded" />
@@ -728,7 +526,7 @@ function ChannelCard(props: {
   const { r, m, ratio, saved, onToggleSave } = props;
 
   const firstUpload = r.first_upload_at ? new Date(r.first_upload_at).toISOString().slice(0, 10) : "-";
-  const region = (r.country || "OTHER").toUpperCase();
+  const yt = `https://www.youtube.com/channel/${r.channel_id}`;
 
   return (
     <div
@@ -742,14 +540,6 @@ function ChannelCard(props: {
           <div className="text-base font-semibold leading-snug line-clamp-2">{r.title || "Untitled channel"}</div>
           <div className="mt-1 text-xs text-white/55">{r.channel_id}</div>
         </div>
-
-        <span
-          className="shrink-0 inline-flex items-center rounded-full border border-emerald-400/25 bg-emerald-400/10
-                     px-2 py-1 text-[11px] font-semibold text-emerald-200
-                     shadow-[0_0_18px_rgba(34,255,170,0.14)]"
-        >
-          {region}
-        </span>
       </div>
 
       <div className="mt-4 grid grid-cols-2 gap-3">
@@ -760,43 +550,31 @@ function ChannelCard(props: {
       </div>
 
       <div className="mt-4 rounded-2xl border border-white/10 bg-black/25 p-4">
-        <div className="flex items-center justify-between">
-          <div className="text-xs text-white/60">Recent AVG (14d)</div>
-          <div className="text-sm font-semibold">{fmt(m?.recent_avg_views)}</div>
-        </div>
-
-        <div className="mt-2 flex items-center justify-between">
-          <div className="text-xs text-white/60">Recent Shorts Count</div>
-          <div className="text-sm font-semibold">{fmt(m?.recent_short_count)}</div>
-        </div>
-
-        <div className="mt-2 flex items-center justify-between">
-          <div className="text-xs text-white/60">Ratio</div>
-          {ratio === null ? (
-            <div className="text-sm font-semibold text-white/60">-</div>
-          ) : (
-            <div className="text-sm font-semibold text-emerald-200">
-              {ratio.toFixed(4)}
-            </div>
-          )}
-        </div>
+        <Row label="Recent AVG (14d)" value={fmt(m?.recent_avg_views)} />
+        <Row label="Shorts Count (14d)" value={fmt(m?.recent_short_count)} />
+        <Row label="Ratio" value={ratio === null ? "-" : ratio.toFixed(4)} />
       </div>
 
-      <div className="mt-4 flex items-center justify-between">
+      <div className="mt-4 flex items-center justify-between gap-2">
+        <a
+          href={yt}
+          target="_blank"
+          rel="noreferrer"
+          className="rounded-xl px-3 py-2 text-xs font-semibold border border-emerald-400/25 bg-emerald-400/10 hover:bg-emerald-400/15 transition"
+        >
+          Open Channel
+        </a>
+
         <button
           onClick={onToggleSave}
           className={`rounded-xl px-3 py-2 text-xs font-semibold border transition ${
             saved
-              ? "border-emerald-400/30 bg-emerald-400/10 shadow-[0_0_18px_rgba(34,255,170,0.16)]"
+              ? "border-emerald-400/30 bg-emerald-400/10"
               : "border-white/10 bg-white/5 hover:bg-white/10"
           }`}
         >
           {saved ? "Saved" : "Save"}
         </button>
-
-        <div className="text-[11px] text-white/45">
-          Hover glow • Neon UI
-        </div>
       </div>
     </div>
   );
@@ -807,6 +585,15 @@ function Stat(props: { label: string; value: string }) {
     <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
       <div className="text-[11px] text-white/55">{props.label}</div>
       <div className="mt-1 text-sm font-semibold">{props.value}</div>
+    </div>
+  );
+}
+
+function Row(props: { label: string; value: string }) {
+  return (
+    <div className="flex items-center justify-between">
+      <div className="text-xs text-white/60">{props.label}</div>
+      <div className="text-sm font-semibold">{props.value}</div>
     </div>
   );
 }

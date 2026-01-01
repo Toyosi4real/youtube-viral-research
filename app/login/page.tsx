@@ -1,25 +1,16 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { supabaseBrowser } from "@/lib/supabaseBrowser";
 
 export default function LoginPage() {
   const router = useRouter();
 
-  const [nextPath, setNextPath] = useState("/dashboard");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [msg, setMsg] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-
-  useEffect(() => {
-    try {
-      const url = new URL(window.location.href);
-      const next = url.searchParams.get("next");
-      if (next && next.startsWith("/")) setNextPath(next);
-    } catch {}
-  }, []);
 
   async function signIn(e: React.FormEvent) {
     e.preventDefault();
@@ -36,7 +27,7 @@ export default function LoginPage() {
     }
 
     router.refresh();
-    router.push(nextPath);
+    router.push("/dashboard");
   }
 
   async function signUp() {
@@ -48,7 +39,7 @@ export default function LoginPage() {
     setLoading(false);
 
     if (error) setMsg(error.message);
-    else setMsg("Account created. If email confirmation is ON, confirm email then sign in.");
+    else setMsg("Account created. Please sign in.");
   }
 
   return (
@@ -64,7 +55,7 @@ export default function LoginPage() {
             <div className="h-10 w-10 rounded-xl bg-[radial-gradient(circle_at_30%_30%,rgba(34,255,170,0.9),rgba(139,92,246,0.7))] shadow-[0_0_24px_rgba(34,255,170,0.25)] animate-pulse" />
             <div>
               <div className="text-xl font-semibold">Kelvin YouTube Short Channel Finder</div>
-              <div className="text-xs text-white/60">Sign in to continue</div>
+              <div className="text-xs text-white/60">Sign in</div>
             </div>
           </div>
 
@@ -107,10 +98,6 @@ export default function LoginPage() {
           </form>
 
           {msg && <p className="mt-4 text-sm text-white/80">{msg}</p>}
-
-          <p className="mt-6 text-xs text-white/50">
-            Redirect after login: <span className="text-white/70">{nextPath}</span>
-          </p>
         </div>
       </div>
     </main>

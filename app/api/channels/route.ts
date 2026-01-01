@@ -44,6 +44,7 @@ function applySort(q: any, sort: SortKey) {
 export async function GET(req: Request) {
   const url = new URL(req.url);
 
+  // Optional live refresh
   const refresh = url.searchParams.get("refresh") === "1";
   if (refresh) {
     if (!process.env.CRON_SECRET) {
@@ -54,17 +55,14 @@ export async function GET(req: Request) {
 
     const d = await fetch(`${origin}/api/discover`, { method: "POST", headers: h, cache: "no-store" });
     const dj = await d.json().catch(() => ({}));
-    if (!dj.ok) {
-      return NextResponse.json({ ok: false, error: `Discover failed: ${dj.error || "unknown"}` }, { status: 400 });
-    }
+    if (!dj.ok) return NextResponse.json({ ok: false, error: `Discover failed: ${dj.error || "unknown"}` }, { status: 400 });
 
     const m = await fetch(`${origin}/api/compute-metrics`, { method: "POST", headers: h, cache: "no-store" });
     const mj = await m.json().catch(() => ({}));
-    if (!mj.ok) {
-      return NextResponse.json({ ok: false, error: `Metrics failed: ${mj.error || "unknown"}` }, { status: 400 });
-    }
+    if (!mj.ok) return NextResponse.json({ ok: false, error: `Metrics failed: ${mj.error || "unknown"}` }, { status: 400 });
   }
 
+  // Filters
   const primarySort = (url.searchParams.get("primarySort") || "bestRatio") as SortKey;
   const secondarySort = (url.searchParams.get("secondarySort") || "none") as SortKey;
 
@@ -82,21 +80,54 @@ export async function GET(req: Request) {
 
   const searchTitle = (url.searchParams.get("searchTitle") || "").trim();
 
-  // LEFT join metrics so results can exist even before metrics are computed
+  // 14-day window
+  const since = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+
+  // 1) Build allow-list: channels that posted at least 1 short in last 14d
+  const { data: shortCh, error: shortErr } = await supabaseAdmin
+    .from("videos")
+    .select("channel_id")
+    .eq("is_short", true)
+    .gte("published_at", since);
+
+  if (shortErr) return NextResponse.json({ ok: false, error: shortErr.message }, { status: 400 });
+
+  const shortSet = new Set((shortCh || []).map((x: any) => x.channel_id));
+
+  // 2) Build block-list: channels that posted any long video in last 14d
+  const { data: longCh, error: longErr } = await supabaseAdmin
+    .from("videos")
+    .select("channel_id")
+    .eq("is_short", false)
+    .gte("published_at", since);
+
+  if (longErr) return NextResponse.json({ ok: false, error: longErr.message }, { status: 400 });
+
+  const longSet = new Set((longCh || []).map((x: any) => x.channel_id));
+
+  // Final eligible channel IDs: has short, has no long
+  const eligibleIds = Array.from(shortSet).filter((id) => !longSet.has(id));
+
+  if (eligibleIds.length === 0) {
+    return NextResponse.json({ ok: true, results: [] });
+  }
+
+  // 3) Query channels + metrics with filters
   let q = supabaseAdmin
     .from("channels")
     .select(`
-      channel_id,title,country,subscriber_count,video_count,view_count,first_upload_at,
+      channel_id,title,subscriber_count,video_count,view_count,first_upload_at,
       channel_metrics (recent_days,recent_short_count,recent_avg_views,recent_total_views,ratio_views_per_sub,computed_at)
-    `);
+    `)
+    .in("channel_id", eligibleIds);
 
-  // base filters (always safe)
+  // base filters
   q = q.gte("subscriber_count", minSubs).lte("subscriber_count", maxSubs);
   q = q.gte("video_count", minVideos).lte("video_count", maxVideos);
 
   if (searchTitle) q = q.ilike("title", `%${searchTitle}%`);
 
-  // metric-based filters only apply if metrics exist / requested
+  // enhanced filter gates
   if (enhancedOnly) {
     q = q.not("channel_metrics.recent_avg_views", "is", null);
     q = q.gte("channel_metrics.recent_avg_views", minRecentAvg).lte("channel_metrics.recent_avg_views", maxRecentAvg);
