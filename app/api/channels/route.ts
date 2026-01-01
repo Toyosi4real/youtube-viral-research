@@ -44,12 +44,13 @@ function applySort(q: any, sort: SortKey) {
 export async function GET(req: Request) {
   const url = new URL(req.url);
 
-  // Optional live refresh
   const refresh = url.searchParams.get("refresh") === "1";
+
   if (refresh) {
     if (!process.env.CRON_SECRET) {
       return NextResponse.json({ ok: false, error: "Server missing CRON_SECRET env var" }, { status: 400 });
     }
+
     const origin = url.origin;
     const h = { "x-cron-secret": process.env.CRON_SECRET! };
 
@@ -109,17 +110,21 @@ export async function GET(req: Request) {
 
   const eligibleIds = Array.from(shortSet).filter((id) => !longSet.has(id));
 
-  if (eligibleIds.length === 0) {
-    return NextResponse.json({ ok: true, results: [] });
-  }
+  if (eligibleIds.length === 0) return NextResponse.json({ ok: true, results: [] });
 
   let q = supabaseAdmin
     .from("channels")
     .select(`
-      channel_id,title,subscriber_count,video_count,view_count,first_upload_at,
+      channel_id,title,subscriber_count,video_count,view_count,first_upload_at,updated_at,
       channel_metrics (recent_days,recent_short_count,recent_avg_views,recent_total_views,ratio_views_per_sub,computed_at)
     `)
     .in("channel_id", eligibleIds);
+
+  // If this request was a Live Refresh, show ONLY newly refreshed channels
+  if (refresh) {
+    const freshSince = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(); // last 2 hours
+    q = q.gte("updated_at", freshSince);
+  }
 
   q = q.gte("subscriber_count", minSubs).lte("subscriber_count", maxSubs);
   q = q.gte("video_count", minVideos).lte("video_count", maxVideos);
