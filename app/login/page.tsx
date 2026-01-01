@@ -1,8 +1,10 @@
 "use client";
 import { useState } from "react";
+import { useRouter } from "next/navigation";
 import { supabaseBrowser } from "@/lib/supabaseBrowser";
 
 export default function LoginPage() {
+  const router = useRouter();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [msg, setMsg] = useState<string | null>(null);
@@ -10,16 +12,23 @@ export default function LoginPage() {
   async function signIn(e: React.FormEvent) {
     e.preventDefault();
     setMsg(null);
+
     const { error } = await supabaseBrowser.auth.signInWithPassword({ email, password });
-    if (error) setMsg(error.message);
-    else window.location.href = "/dashboard";
+    if (error) {
+      setMsg(error.message);
+      return;
+    }
+
+    // cookie is now set; refresh + push so middleware sees it
+    router.refresh();
+    router.push("/dashboard");
   }
 
   async function signUp() {
     setMsg(null);
     const { error } = await supabaseBrowser.auth.signUp({ email, password });
     if (error) setMsg(error.message);
-    else setMsg("Account created. Sign in now (or confirm email if enabled).");
+    else setMsg("Account created. If email confirmation is on, check your inbox, then sign in.");
   }
 
   return (
