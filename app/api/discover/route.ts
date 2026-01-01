@@ -4,19 +4,20 @@ import { ytGet, isoDurationToSeconds } from "@/lib/youtube";
 
 function assertCron(req: Request) {
   const secret = req.headers.get("x-cron-secret");
-  if (!secret || secret !== process.env.CRON_SECRET) throw new Error("Unauthorized");
+  if (!process.env.CRON_SECRET) throw new Error("CRON_SECRET env is missing on server");
+  if (!secret || secret !== process.env.CRON_SECRET) throw new Error("Unauthorized (bad CRON secret)");
 }
 
 const REGIONS = ["US", "GB", "CA", "AU"];
 
-// Quota-safe caps
+// quota-safe caps
 const MOST_POPULAR_PER_REGION = 25;
-const MAX_CHANNELS_TO_CRAWL_PER_RUN = 80;
+const MAX_CHANNELS_TO_CRAWL_PER_RUN = 60;
 const UPLOADS_TO_FETCH_PER_CHANNEL = 25;
 
-// Shorts length constraint
-const MIN_SHORT_SECONDS = 10;
-const MAX_SHORT_SECONDS = 40;
+// Shorts constraint (YouTube Shorts are <= 60 seconds)
+const MAX_SHORT_SECONDS = 60;
+const MIN_SHORT_SECONDS = 1;
 
 function chunk<T>(arr: T[], size: number) {
   const out: T[][] = [];
@@ -28,7 +29,7 @@ export async function POST(req: Request) {
   try {
     assertCron(req);
 
-    // 1) seed channels from mostPopular
+    // 1) seed channels from mostPopular videos in target regions
     const discoveredChannelIds: string[] = [];
 
     for (const regionCode of REGIONS) {
@@ -46,11 +47,12 @@ export async function POST(req: Request) {
     }
 
     const uniqueChannelIds = Array.from(new Set(discoveredChannelIds)).slice(0, MAX_CHANNELS_TO_CRAWL_PER_RUN);
+
     if (uniqueChannelIds.length === 0) {
       return NextResponse.json({ ok: true, crawledChannels: 0, shortsUpserted: 0 });
     }
 
-    // 2) fetch channel details (uploads playlist + stats)
+    // 2) fetch channel details
     const channelDetails: any[] = [];
     for (const ids of chunk(uniqueChannelIds, 50)) {
       const c = await ytGet("channels", {
@@ -60,6 +62,7 @@ export async function POST(req: Request) {
       for (const item of c.items || []) channelDetails.push(item);
     }
 
+    // upsert channels + snapshot
     const channelRows = channelDetails.map((ch: any) => ({
       channel_id: ch.id,
       title: ch.snippet?.title ?? null,
@@ -85,7 +88,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // 3) crawl uploads playlist and ingest SHORTS only (10–40s)
+    // 3) crawl uploads and ingest SHORTS only (<=60s)
     let totalShortsUpserted = 0;
     let channelsCrawled = 0;
 
@@ -155,9 +158,10 @@ export async function POST(req: Request) {
       ok: true,
       crawledChannels: channelsCrawled,
       shortsUpserted: totalShortsUpserted,
-      shortSeconds: `${MIN_SHORT_SECONDS}-${MAX_SHORT_SECONDS}`,
+      shortsSeconds: `<=${MAX_SHORT_SECONDS}s`,
     });
   } catch (e: any) {
+    // IMPORTANT: expose real reason to the UI
     return NextResponse.json({ ok: false, error: e.message }, { status: 400 });
   }
 }

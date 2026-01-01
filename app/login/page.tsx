@@ -10,19 +10,15 @@ export default function LoginPage() {
   const [nextPath, setNextPath] = useState("/dashboard");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-
   const [msg, setMsg] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
-  // Read ?next=... ONLY on client to avoid prerender errors
   useEffect(() => {
     try {
       const url = new URL(window.location.href);
       const next = url.searchParams.get("next");
       if (next && next.startsWith("/")) setNextPath(next);
-    } catch {
-      // ignore
-    }
+    } catch {}
   }, []);
 
   async function signIn(e: React.FormEvent) {
@@ -58,8 +54,8 @@ export default function LoginPage() {
   return (
     <main className="min-h-screen text-white">
       <div className="fixed inset-0 -z-10 bg-[#05060a]">
-        <div className="absolute inset-0 opacity-70 bg-[radial-gradient(ellipse_at_top,_rgba(34,255,170,0.18),_transparent_55%),radial-gradient(ellipse_at_bottom,_rgba(139,92,246,0.18),_transparent_55%)]" />
-        <div className="absolute inset-0 opacity-35 bg-[linear-gradient(to_right,rgba(34,255,170,0.08),transparent_35%,rgba(139,92,246,0.08))]" />
+        <div className="absolute inset-0 opacity-70 bg-[radial-gradient(ellipse_at_top,_rgba(34,255,170,0.20),_transparent_55%),radial-gradient(ellipse_at_bottom,_rgba(139,92,246,0.20),_transparent_55%)]" />
+        <div className="absolute inset-0 opacity-35 bg-[linear-gradient(to_right,rgba(34,255,170,0.10),transparent_35%,rgba(139,92,246,0.10))]" />
       </div>
 
       <div className="mx-auto max-w-md px-4 pt-24">
@@ -67,7 +63,7 @@ export default function LoginPage() {
           <div className="flex items-center gap-3">
             <div className="h-10 w-10 rounded-xl bg-[radial-gradient(circle_at_30%_30%,rgba(34,255,170,0.9),rgba(139,92,246,0.7))] shadow-[0_0_24px_rgba(34,255,170,0.25)] animate-pulse" />
             <div>
-              <div className="text-xl font-semibold">ViewHunt</div>
+              <div className="text-xl font-semibold">Kelvin YouTube Short Channel Finder</div>
               <div className="text-xs text-white/60">Sign in to continue</div>
             </div>
           </div>
