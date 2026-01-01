@@ -1,167 +1,141 @@
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabaseAdmin";
-import { ytGet, isoDurationToSeconds } from "@/lib/youtube";
-
-function assertCron(req: Request) {
-  const secret = req.headers.get("x-cron-secret");
-  if (!process.env.CRON_SECRET) throw new Error("CRON_SECRET env is missing on server");
-  if (!secret || secret !== process.env.CRON_SECRET) throw new Error("Unauthorized (bad CRON secret)");
-}
-
-const REGIONS = ["US", "GB", "CA", "AU"];
-
-// quota-safe caps
-const MOST_POPULAR_PER_REGION = 25;
-const MAX_CHANNELS_TO_CRAWL_PER_RUN = 60;
-const UPLOADS_TO_FETCH_PER_CHANNEL = 25;
-
-// Shorts constraint (YouTube Shorts are <= 60 seconds)
-const MAX_SHORT_SECONDS = 60;
-const MIN_SHORT_SECONDS = 1;
-
-function chunk<T>(arr: T[], size: number) {
-  const out: T[][] = [];
-  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-  return out;
-}
+import { ytGet, parseDuration } from "@/lib/youtube";
 
 export async function POST(req: Request) {
-  try {
-    assertCron(req);
+  // Protect endpoint (used by Live Refresh + GitHub cron)
+  const secret = req.headers.get("x-cron-secret");
+  if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+    return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+  }
 
-    // 1) seed channels from mostPopular videos in target regions
-    const discoveredChannelIds: string[] = [];
+  // Internal regions to diversify discovery (NOT shown in UI, NOT restricting your filters)
+  const REGIONS = ["US", "GB", "CA", "AU"];
 
-    for (const regionCode of REGIONS) {
-      const popular = await ytGet("videos", {
-        part: "snippet",
-        chart: "mostPopular",
-        regionCode,
-        maxResults: String(MOST_POPULAR_PER_REGION),
+  // Each refresh picks a different slice of the 3–10 day window
+  const now = Date.now();
+  const daysAgo = 3 + Math.floor(Math.random() * 8); // 3..10
+  const publishedAfter = new Date(now - daysAgo * 24 * 60 * 60 * 1000).toISOString();
+
+  // We will discover up to ~400 candidate videos per refresh (then filter to true shorts)
+  const discoveredVideoIds = new Set<string>();
+  const discoveredChannelIds = new Set<string>();
+
+  for (const region of REGIONS) {
+    // Search for high-view recent content (3–10 days old)
+    // videoDuration=short means <4 minutes, but we later enforce <=60 seconds via contentDetails.duration.
+    const s = await ytGet("search", {
+      part: "id",
+      type: "video",
+      order: "viewCount",
+      maxResults: 50,
+      regionCode: region,
+      publishedAfter,
+      videoDuration: "short",
+      safeSearch: "none",
+    });
+
+    for (const item of s.items || []) {
+      const id = item?.id?.videoId;
+      if (id) discoveredVideoIds.add(id);
+    }
+  }
+
+  const ids = Array.from(discoveredVideoIds);
+  if (ids.length === 0) return NextResponse.json({ ok: true, inserted: 0 });
+
+  // Fetch full details for videos (contentDetails for duration + statistics)
+  // videos.list max 50 ids per call
+  const chunks: string[][] = [];
+  for (let i = 0; i < ids.length; i += 50) chunks.push(ids.slice(i, i + 50));
+
+  let inserted = 0;
+
+  for (const chunk of chunks) {
+    const v = await ytGet("videos", {
+      part: "snippet,statistics,contentDetails",
+      id: chunk.join(","),
+      maxResults: 50,
+    });
+
+    const videoUpserts: any[] = [];
+    const channelUpsertsBasic: any[] = [];
+
+    for (const item of v.items || []) {
+      const durationSeconds = parseDuration(item?.contentDetails?.duration || "");
+      const isShort = durationSeconds > 0 && durationSeconds <= 60;
+
+      // Optional quality gate: ignore ultra-short junk (you can remove this if you want)
+      if (!isShort) continue;
+      if (durationSeconds < 10) continue;
+
+      const channelId = item?.snippet?.channelId;
+      const videoId = item?.id;
+      if (!channelId || !videoId) continue;
+
+      discoveredChannelIds.add(channelId);
+
+      // Upsert channel basic fields (stats updated in next step)
+      channelUpsertsBasic.push({
+        channel_id: channelId,
+        title: item?.snippet?.channelTitle || null,
+        updated_at: new Date().toISOString(),
       });
 
-      for (const it of popular.items || []) {
-        const chId = it?.snippet?.channelId;
-        if (chId) discoveredChannelIds.push(chId);
-      }
-    }
-
-    const uniqueChannelIds = Array.from(new Set(discoveredChannelIds)).slice(0, MAX_CHANNELS_TO_CRAWL_PER_RUN);
-
-    if (uniqueChannelIds.length === 0) {
-      return NextResponse.json({ ok: true, crawledChannels: 0, shortsUpserted: 0 });
-    }
-
-    // 2) fetch channel details
-    const channelDetails: any[] = [];
-    for (const ids of chunk(uniqueChannelIds, 50)) {
-      const c = await ytGet("channels", {
-        part: "snippet,statistics,contentDetails",
-        id: ids.join(","),
+      // Upsert video
+      videoUpserts.push({
+        video_id: videoId,
+        channel_id: channelId,
+        title: item?.snippet?.title || null,
+        published_at: item?.snippet?.publishedAt || null,
+        duration_seconds: durationSeconds,
+        is_short: true,
+        view_count: Number(item?.statistics?.viewCount || 0),
+        like_count: Number(item?.statistics?.likeCount || 0),
+        comment_count: Number(item?.statistics?.commentCount || 0),
+        updated_at: new Date().toISOString(),
       });
-      for (const item of c.items || []) channelDetails.push(item);
     }
 
-    // upsert channels + snapshot
-    const channelRows = channelDetails.map((ch: any) => ({
-      channel_id: ch.id,
-      title: ch.snippet?.title ?? null,
-      country: ch.snippet?.country ?? null,
-      published_at: ch.snippet?.publishedAt ?? null,
-      subscriber_count: ch.statistics?.hiddenSubscriberCount ? 0 : Number(ch.statistics?.subscriberCount ?? 0),
-      video_count: Number(ch.statistics?.videoCount ?? 0),
-      view_count: Number(ch.statistics?.viewCount ?? 0),
+    if (channelUpsertsBasic.length) {
+      await supabaseAdmin.from("channels").upsert(channelUpsertsBasic, { onConflict: "channel_id" });
+    }
+
+    if (videoUpserts.length) {
+      const { error } = await supabaseAdmin.from("videos").upsert(videoUpserts, { onConflict: "video_id" });
+      if (!error) inserted += videoUpserts.length;
+    }
+  }
+
+  // Update channel statistics in batch (subs, total views, video count)
+  const chIds = Array.from(discoveredChannelIds);
+  for (let i = 0; i < chIds.length; i += 50) {
+    const batch = chIds.slice(i, i + 50);
+    const c = await ytGet("channels", {
+      part: "snippet,statistics",
+      id: batch.join(","),
+      maxResults: 50,
+    });
+
+    const channelStatsUpserts = (c.items || []).map((it: any) => ({
+      channel_id: it?.id,
+      title: it?.snippet?.title || null,
+      subscriber_count: Number(it?.statistics?.subscriberCount || 0),
+      video_count: Number(it?.statistics?.videoCount || 0),
+      view_count: Number(it?.statistics?.viewCount || 0),
       updated_at: new Date().toISOString(),
     }));
 
-    if (channelRows.length) {
-      await supabaseAdmin.from("channels").upsert(channelRows, { onConflict: "channel_id" });
-
-      await supabaseAdmin.from("channel_snapshots").insert(
-        channelRows.map((r) => ({
-          channel_id: r.channel_id,
-          captured_at: new Date().toISOString(),
-          subscriber_count: r.subscriber_count,
-          video_count: r.video_count,
-          view_count: r.view_count,
-        }))
-      );
+    if (channelStatsUpserts.length) {
+      await supabaseAdmin.from("channels").upsert(channelStatsUpserts, { onConflict: "channel_id" });
     }
-
-    // 3) crawl uploads and ingest SHORTS only (<=60s)
-    let totalShortsUpserted = 0;
-    let channelsCrawled = 0;
-
-    for (const ch of channelDetails) {
-      const uploadsPlaylistId = ch.contentDetails?.relatedPlaylists?.uploads;
-      if (!uploadsPlaylistId) continue;
-
-      channelsCrawled++;
-
-      const pl = await ytGet("playlistItems", {
-        part: "contentDetails",
-        playlistId: uploadsPlaylistId,
-        maxResults: String(UPLOADS_TO_FETCH_PER_CHANNEL),
-      });
-
-      const videoIds = Array.from(
-        new Set((pl.items || []).map((x: any) => x.contentDetails?.videoId).filter(Boolean))
-      );
-      if (!videoIds.length) continue;
-
-      for (const ids of chunk(videoIds, 50)) {
-        const v = await ytGet("videos", {
-          part: "snippet,contentDetails,statistics",
-          id: ids.join(","),
-        });
-
-        const shortRows = (v.items || [])
-          .map((it: any) => {
-            const dur = isoDurationToSeconds(it.contentDetails?.duration ?? "PT0S");
-            const isShort = dur >= MIN_SHORT_SECONDS && dur <= MAX_SHORT_SECONDS;
-            if (!isShort) return null;
-
-            return {
-              video_id: it.id,
-              channel_id: it.snippet?.channelId ?? ch.id,
-              title: it.snippet?.title ?? null,
-              published_at: it.snippet?.publishedAt ?? null,
-              duration_seconds: dur,
-              is_short: true,
-              view_count: Number(it.statistics?.viewCount ?? 0),
-              like_count: Number(it.statistics?.likeCount ?? 0),
-              comment_count: Number(it.statistics?.commentCount ?? 0),
-              updated_at: new Date().toISOString(),
-            };
-          })
-          .filter(Boolean) as any[];
-
-        if (!shortRows.length) continue;
-
-        await supabaseAdmin.from("videos").upsert(shortRows, { onConflict: "video_id" });
-
-        await supabaseAdmin.from("video_snapshots").insert(
-          shortRows.map((r) => ({
-            video_id: r.video_id,
-            captured_at: new Date().toISOString(),
-            view_count: r.view_count,
-            like_count: r.like_count,
-            comment_count: r.comment_count,
-          }))
-        );
-
-        totalShortsUpserted += shortRows.length;
-      }
-    }
-
-    return NextResponse.json({
-      ok: true,
-      crawledChannels: channelsCrawled,
-      shortsUpserted: totalShortsUpserted,
-      shortsSeconds: `<=${MAX_SHORT_SECONDS}s`,
-    });
-  } catch (e: any) {
-    // IMPORTANT: expose real reason to the UI
-    return NextResponse.json({ ok: false, error: e.message }, { status: 400 });
   }
+
+  return NextResponse.json({
+    ok: true,
+    inserted,
+    window_days_ago: daysAgo,
+    discovered_videos: ids.length,
+    discovered_channels: chIds.length,
+  });
 }

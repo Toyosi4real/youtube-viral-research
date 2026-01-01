@@ -62,7 +62,6 @@ export async function GET(req: Request) {
     if (!mj.ok) return NextResponse.json({ ok: false, error: `Metrics failed: ${mj.error || "unknown"}` }, { status: 400 });
   }
 
-  // Filters
   const primarySort = (url.searchParams.get("primarySort") || "bestRatio") as SortKey;
   const secondarySort = (url.searchParams.get("secondarySort") || "none") as SortKey;
 
@@ -80,39 +79,40 @@ export async function GET(req: Request) {
 
   const searchTitle = (url.searchParams.get("searchTitle") || "").trim();
 
-  // 14-day window
-  const since = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+  // Shorts activity window: 14 days
+  const sinceShort = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
 
-  // 1) Build allow-list: channels that posted at least 1 short in last 14d
+  // No-long-video window: 5 months ~ 150 days
+  const sinceLong = new Date(Date.now() - 150 * 24 * 60 * 60 * 1000).toISOString();
+
+  // Must have at least 1 short in last 14 days
   const { data: shortCh, error: shortErr } = await supabaseAdmin
     .from("videos")
     .select("channel_id")
     .eq("is_short", true)
-    .gte("published_at", since);
+    .gte("published_at", sinceShort);
 
   if (shortErr) return NextResponse.json({ ok: false, error: shortErr.message }, { status: 400 });
 
   const shortSet = new Set((shortCh || []).map((x: any) => x.channel_id));
 
-  // 2) Build block-list: channels that posted any long video in last 14d
+  // Must have zero long videos in last 5 months
   const { data: longCh, error: longErr } = await supabaseAdmin
     .from("videos")
     .select("channel_id")
     .eq("is_short", false)
-    .gte("published_at", since);
+    .gte("published_at", sinceLong);
 
   if (longErr) return NextResponse.json({ ok: false, error: longErr.message }, { status: 400 });
 
   const longSet = new Set((longCh || []).map((x: any) => x.channel_id));
 
-  // Final eligible channel IDs: has short, has no long
   const eligibleIds = Array.from(shortSet).filter((id) => !longSet.has(id));
 
   if (eligibleIds.length === 0) {
     return NextResponse.json({ ok: true, results: [] });
   }
 
-  // 3) Query channels + metrics with filters
   let q = supabaseAdmin
     .from("channels")
     .select(`
@@ -121,20 +121,17 @@ export async function GET(req: Request) {
     `)
     .in("channel_id", eligibleIds);
 
-  // base filters
   q = q.gte("subscriber_count", minSubs).lte("subscriber_count", maxSubs);
   q = q.gte("video_count", minVideos).lte("video_count", maxVideos);
 
   if (searchTitle) q = q.ilike("title", `%${searchTitle}%`);
 
-  // enhanced filter gates
   if (enhancedOnly) {
     q = q.not("channel_metrics.recent_avg_views", "is", null);
     q = q.gte("channel_metrics.recent_avg_views", minRecentAvg).lte("channel_metrics.recent_avg_views", maxRecentAvg);
     if (activeRecently) q = q.gte("channel_metrics.recent_short_count", 4);
   }
 
-  // sorts
   q = applySort(q, primarySort);
   if (secondarySort !== "none") q = applySort(q, secondarySort);
 
