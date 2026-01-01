@@ -23,8 +23,8 @@ const SORTS: { label: string; value: SortKey }[] = [
   { label: "Least Subscribers", value: "leastSubs" },
   { label: "Most videos", value: "mostVideos" },
   { label: "Least videos", value: "leastVideos" },
-  { label: "Newest first (by first upload)", value: "newestFirst" },
-  { label: "Oldest first (by first upload)", value: "oldestFirst" },
+  { label: "Newest channel (by first upload)", value: "newestFirst" },
+  { label: "Oldest channel (by first upload)", value: "oldestFirst" },
 ];
 
 function fmt(n?: number) {
@@ -32,13 +32,97 @@ function fmt(n?: number) {
   return n.toLocaleString();
 }
 
+function clamp(n: number, a: number, b: number) {
+  return Math.max(a, Math.min(b, n));
+}
+
+function seededRandom(seed: number) {
+  // mulberry32
+  return function () {
+    seed |= 0;
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function weightedShuffle(items: any[], weights: Record<string, number>, seed: number) {
+  // Weights by channel country code; unknown -> OTHER
+  const byRegion: Record<string, any[]> = {};
+  for (const it of items) {
+    const r = (it.country || "OTHER").toUpperCase();
+    if (!byRegion[r]) byRegion[r] = [];
+    byRegion[r].push(it);
+  }
+
+  // shuffle inside each region
+  const rng = seededRandom(seed);
+  for (const k of Object.keys(byRegion)) {
+    const arr = byRegion[k];
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(rng() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+  }
+
+  // build a weighted picker list
+  const regions = Object.keys(byRegion);
+  const w: Record<string, number> = {};
+  let total = 0;
+
+  for (const r of regions) {
+    const wt = clamp(Number(weights[r] ?? weights["OTHER"] ?? 1), 0, 1000);
+    if (wt <= 0 || byRegion[r].length === 0) continue;
+    w[r] = wt;
+    total += wt;
+  }
+
+  // if everything 0, just flatten
+  if (total <= 0) return items;
+
+  const out: any[] = [];
+  const remaining = () => regions.some((r) => (byRegion[r]?.length ?? 0) > 0);
+
+  while (remaining()) {
+    // pick region by weight
+    let roll = rng() * total;
+    let chosen: string | null = null;
+
+    for (const r of Object.keys(w)) {
+      roll -= w[r];
+      if (roll <= 0) {
+        chosen = r;
+        break;
+      }
+    }
+    chosen = chosen || Object.keys(w)[0];
+
+    // if chosen region empty, find next non-empty
+    if (!byRegion[chosen] || byRegion[chosen].length === 0) {
+      const alt = Object.keys(w).find((r) => (byRegion[r]?.length ?? 0) > 0);
+      if (!alt) break;
+      chosen = alt;
+    }
+
+    out.push(byRegion[chosen].shift());
+
+    // if a region empties, reduce total
+    if ((byRegion[chosen]?.length ?? 0) === 0) {
+      total -= w[chosen];
+      delete w[chosen];
+      if (total <= 0) break;
+    }
+  }
+
+  return out;
+}
+
 export default function DashboardPage() {
   const [tab, setTab] = useState<"discover" | "saved">("discover");
-
-  // user
   const [userId, setUserId] = useState<string | null>(null);
 
-  // draft filters
+  // filters
   const [primarySort, setPrimarySort] = useState<SortKey>("bestRatio");
   const [secondarySort, setSecondarySort] = useState<SortKey>("none");
 
@@ -56,7 +140,15 @@ export default function DashboardPage() {
 
   const [searchTitle, setSearchTitle] = useState("");
 
-  // results (discover)
+  // region weighting sliders (0–100)
+  const [wUS, setWUS] = useState(100);
+  const [wGB, setWGB] = useState(70);
+  const [wCA, setWCA] = useState(70);
+  const [wAU, setWAU] = useState(70);
+  const [randomize, setRandomize] = useState(true);
+
+  // discover results
+  const [rawRows, setRawRows] = useState<any[]>([]);
   const [rows, setRows] = useState<any[]>([]);
   const [hasSearched, setHasSearched] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -67,6 +159,16 @@ export default function DashboardPage() {
   const [savedRows, setSavedRows] = useState<any[]>([]);
   const [savedLoading, setSavedLoading] = useState(false);
   const [savedErr, setSavedErr] = useState<string | null>(null);
+
+  const weights = useMemo(() => {
+    return {
+      US: wUS,
+      GB: wGB,
+      CA: wCA,
+      AU: wAU,
+      OTHER: 10,
+    };
+  }, [wUS, wGB, wCA, wAU]);
 
   const qs = useMemo(() => {
     const p = new URLSearchParams();
@@ -91,28 +193,20 @@ export default function DashboardPage() {
     (async () => {
       const { data } = await supabaseBrowser.auth.getUser();
       setUserId(data.user?.id ?? null);
-      if (data.user?.id) {
-        await loadSavedIds();
-      }
+      if (data.user?.id) await loadSavedIds();
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function loadSavedIds() {
-    const { data, error } = await supabaseBrowser
-      .from("saved_channels")
-      .select("channel_id");
-
-    if (!error && data) {
-      setSavedIds(new Set(data.map((x) => x.channel_id)));
-    }
+    const { data, error } = await supabaseBrowser.from("saved_channels").select("channel_id");
+    if (!error && data) setSavedIds(new Set(data.map((x) => x.channel_id)));
   }
 
   async function loadSavedList() {
     setSavedErr(null);
     setSavedLoading(true);
 
-    // join saved_channels -> channels -> metrics
     const { data, error } = await supabaseBrowser
       .from("saved_channels")
       .select(`
@@ -132,10 +226,7 @@ export default function DashboardPage() {
       return;
     }
 
-    const out = (data || [])
-      .map((r: any) => r.channels)
-      .filter(Boolean);
-
+    const out = (data || []).map((r: any) => r.channels).filter(Boolean);
     setSavedRows(out);
   }
 
@@ -170,6 +261,20 @@ export default function DashboardPage() {
     }
   }
 
+  function applyWeighting(list: any[]) {
+    // only shuffle if randomize is ON; otherwise keep backend order
+    if (!randomize) return list;
+
+    // seed: changes per refresh to make it "live"
+    const seed = Math.floor(Date.now() / 1000);
+    return weightedShuffle(list, weights, seed);
+  }
+
+  useEffect(() => {
+    setRows(applyWeighting(rawRows));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rawRows, weights, randomize]);
+
   async function applyFilters(refreshFirst: boolean) {
     setErr(null);
     setHasSearched(true);
@@ -180,10 +285,11 @@ export default function DashboardPage() {
       const res = await fetch(`/api/channels?${qs}${refreshParam}`, { cache: "no-store" });
       const j = await res.json();
       if (!j.ok) throw new Error(j.error || "Request failed");
-      setRows(j.results || []);
+      setRawRows(j.results || []);
       await loadSavedIds();
     } catch (e: any) {
       setErr(e.message);
+      setRawRows([]);
       setRows([]);
     } finally {
       setLoading(false);
@@ -195,30 +301,39 @@ export default function DashboardPage() {
     window.location.href = "/login";
   }
 
-  // when switching to saved tab, load list once
   useEffect(() => {
     if (tab === "saved") loadSavedList();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab]);
 
   return (
-    <main className="min-h-screen text-white">
-      {/* Neon background + subtle animation */}
+    <main className="min-h-screen text-white overflow-hidden">
+      {/* Lively neon background */}
       <div className="fixed inset-0 -z-10 bg-[#05060a]">
-        <div className="absolute inset-0 opacity-70 bg-[radial-gradient(ellipse_at_top,_rgba(34,255,170,0.20),_transparent_55%),radial-gradient(ellipse_at_bottom,_rgba(139,92,246,0.20),_transparent_55%)]" />
-        <div className="absolute inset-0 opacity-30 bg-[linear-gradient(to_right,rgba(34,255,170,0.10),transparent_35%,rgba(139,92,246,0.10))]" />
-        <div className="absolute -top-24 left-10 h-64 w-64 rounded-full bg-emerald-400/10 blur-3xl animate-pulse" />
-        <div className="absolute -bottom-24 right-10 h-64 w-64 rounded-full bg-violet-500/10 blur-3xl animate-pulse" />
+        <div className="absolute inset-0 opacity-70 bg-[radial-gradient(ellipse_at_top,_rgba(34,255,170,0.22),_transparent_55%),radial-gradient(ellipse_at_bottom,_rgba(139,92,246,0.22),_transparent_55%)]" />
+        <div className="absolute inset-0 opacity-20 bg-[linear-gradient(rgba(34,255,170,0.12)_1px,transparent_1px),linear-gradient(90deg,rgba(139,92,246,0.12)_1px,transparent_1px)] [background-size:60px_60px] animate-[gridmove_10s_linear_infinite]" />
+        <div className="absolute -top-24 left-10 h-72 w-72 rounded-full bg-emerald-400/12 blur-3xl animate-[float_6s_ease-in-out_infinite]" />
+        <div className="absolute top-32 right-14 h-80 w-80 rounded-full bg-violet-500/12 blur-3xl animate-[float_7s_ease-in-out_infinite]" />
+        <div className="absolute bottom-0 left-1/3 h-64 w-64 rounded-full bg-cyan-400/10 blur-3xl animate-[float_8s_ease-in-out_infinite]" />
+        <style>{`
+          @keyframes float { 0%,100%{ transform: translateY(0px)} 50%{ transform: translateY(18px)} }
+          @keyframes gridmove { 0%{ transform: translateY(0)} 100%{ transform: translateY(60px)} }
+          @keyframes shimmer { 0%{ background-position: -200% 0 } 100%{ background-position: 200% 0 } }
+        `}</style>
       </div>
 
-      {/* Top navbar */}
+      {/* Navbar */}
       <header className="mx-auto max-w-6xl px-4 pt-6">
-        <div className="flex items-center justify-between rounded-2xl border border-white/10 bg-white/5 backdrop-blur-md px-5 py-4 shadow-[0_0_60px_rgba(34,255,170,0.06)]">
+        <div className="flex items-center justify-between rounded-2xl border border-white/10 bg-white/5 backdrop-blur-md px-5 py-4 shadow-[0_0_70px_rgba(34,255,170,0.08)]">
           <div className="flex items-center gap-3">
-            <div className="h-9 w-9 rounded-xl bg-[radial-gradient(circle_at_30%_30%,rgba(34,255,170,0.9),rgba(139,92,246,0.7))] shadow-[0_0_24px_rgba(34,255,170,0.25)]" />
+            <div className="h-9 w-9 rounded-xl bg-[radial-gradient(circle_at_30%_30%,rgba(34,255,170,0.95),rgba(139,92,246,0.75))] shadow-[0_0_28px_rgba(34,255,170,0.28)]" />
             <div>
-              <div className="text-lg font-semibold tracking-wide">ViewHunt</div>
-              <div className="text-xs text-white/60">Shorts Finder • 10–40s • US/GB/CA/AU</div>
+              <div className="text-lg font-semibold tracking-wide">
+                Kelvin YouTube Short Channel Finder
+              </div>
+              <div className="text-xs text-white/60">
+                US/GB/CA/AU • Shorts ≤ 60s • Recent AVG (14 days)
+              </div>
             </div>
           </div>
 
@@ -254,31 +369,28 @@ export default function DashboardPage() {
         </div>
       </header>
 
-      {/* Content */}
       <section className="mx-auto max-w-6xl px-4 py-10">
         {tab === "discover" ? (
           <>
-            {/* Filters card */}
+            {/* Filters */}
             <div className="rounded-3xl border border-white/10 bg-white/5 backdrop-blur-md shadow-[0_0_60px_rgba(34,255,170,0.08)] overflow-hidden">
               <div className="px-6 py-5 border-b border-white/10 flex items-center justify-between">
                 <div>
-                  <div className="text-xl font-semibold">Channel Filters</div>
+                  <div className="text-xl font-semibold">Filters + Region Weighting</div>
                   <div className="text-sm text-white/60">
-                    Recent AVG window: 14 days • Shorts length: 10–40 seconds
+                    Weighting affects the mix of cards (client-side). Live Refresh pulls new YouTube data first.
                   </div>
                 </div>
 
                 <div className="flex items-center gap-2">
                   <button
                     onClick={() => applyFilters(false)}
-                    className="group relative rounded-2xl px-5 py-3 text-sm font-semibold
+                    className="rounded-2xl px-5 py-3 text-sm font-semibold
                                bg-[linear-gradient(135deg,rgba(34,255,170,0.25),rgba(139,92,246,0.25))]
                                border border-white/15 hover:border-white/25 transition
                                shadow-[0_0_24px_rgba(34,255,170,0.18)]"
                   >
-                    <span className="relative z-10">{loading ? "Applying..." : "Apply Filters"}</span>
-                    <span className="absolute inset-0 rounded-2xl opacity-0 group-hover:opacity-100 transition
-                                     bg-[radial-gradient(circle_at_30%_30%,rgba(34,255,170,0.25),transparent_60%)]" />
+                    {loading ? "Applying..." : "Apply Filters"}
                   </button>
 
                   <button
@@ -286,7 +398,7 @@ export default function DashboardPage() {
                     className="rounded-2xl px-5 py-3 text-sm font-semibold
                                border border-emerald-400/25 bg-emerald-400/10 hover:bg-emerald-400/15 transition
                                shadow-[0_0_22px_rgba(34,255,170,0.14)]"
-                    title="Live refresh: pulls latest data from YouTube first"
+                    title="Pull latest YouTube data, then apply filters"
                   >
                     {loading ? "Refreshing..." : "Live Refresh"}
                   </button>
@@ -294,54 +406,11 @@ export default function DashboardPage() {
               </div>
 
               <div className="p-6 grid grid-cols-1 lg:grid-cols-12 gap-5">
-                <div className="lg:col-span-3">
-                  <label className="text-xs text-white/70">PRIMARY SORT</label>
-                  <select
-                    value={primarySort}
-                    onChange={(e) => setPrimarySort(e.target.value as SortKey)}
-                    className="mt-2 w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-[rgba(34,255,170,0.55)]
-                               shadow-[0_0_18px_rgba(34,255,170,0.08)]"
-                  >
-                    {SORTS.map((s) => (
-                      <option key={s.value} value={s.value} className="bg-[#0b0d14]">
-                        {s.label}
-                      </option>
-                    ))}
-                  </select>
-                </div>
+                <SelectBox title="PRIMARY SORT" value={primarySort} onChange={setPrimarySort} col="lg:col-span-3" />
+                <SelectBox title="SECONDARY SORT" value={secondarySort} onChange={setSecondarySort} col="lg:col-span-3" includeNone />
 
-                <div className="lg:col-span-3">
-                  <label className="text-xs text-white/70">SECONDARY SORT</label>
-                  <select
-                    value={secondarySort}
-                    onChange={(e) => setSecondarySort(e.target.value as SortKey)}
-                    className="mt-2 w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-[rgba(34,255,170,0.55)]
-                               shadow-[0_0_18px_rgba(34,255,170,0.08)]"
-                  >
-                    <option value="none" className="bg-[#0b0d14]">No secondary sort</option>
-                    {SORTS.map((s) => (
-                      <option key={s.value} value={s.value} className="bg-[#0b0d14]">
-                        {s.label}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                <CheckBoxCard
-                  title="Enhanced Only"
-                  desc="Show only channels with Recent AVG data"
-                  checked={enhancedOnly}
-                  onChange={setEnhancedOnly}
-                  col="lg:col-span-3"
-                />
-
-                <CheckBoxCard
-                  title="Active Recently"
-                  desc="4+ shorts posted in last 14 days"
-                  checked={activeRecently}
-                  onChange={setActiveRecently}
-                  col="lg:col-span-3"
-                />
+                <CheckBoxCard title="Enhanced Only" desc="Requires Recent AVG + Ratio data" checked={enhancedOnly} onChange={setEnhancedOnly} col="lg:col-span-3" />
+                <CheckBoxCard title="Active Recently" desc="4+ shorts posted in last 14 days" checked={activeRecently} onChange={setActiveRecently} col="lg:col-span-3" />
 
                 <RangeBox title="RECENT AVG RANGE" min={minRecentAvg} max={maxRecentAvg} setMin={setMinRecentAvg} setMax={setMaxRecentAvg} hint="0 → 5,000,000+" col="lg:col-span-4" />
                 <RangeBox title="SUBSCRIBERS RANGE" min={minSubs} max={maxSubs} setMin={setMinSubs} setMax={setMaxSubs} hint="0 → 5,000,000+" col="lg:col-span-4" />
@@ -361,6 +430,39 @@ export default function DashboardPage() {
                     />
                   </div>
                 </div>
+
+                {/* Region weighting */}
+                <div className="lg:col-span-12 rounded-2xl border border-white/10 bg-black/20 p-4">
+                  <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+                    <div>
+                      <div className="text-sm font-semibold">Region Weighting (Mix Control)</div>
+                      <div className="text-xs text-white/60">
+                        Higher weight = more cards from that region (when country is available).
+                      </div>
+                    </div>
+
+                    <label className="flex items-center gap-2 text-sm border border-white/10 bg-white/5 px-3 py-2 rounded-xl">
+                      <input
+                        type="checkbox"
+                        checked={randomize}
+                        onChange={(e) => setRandomize(e.target.checked)}
+                        className="h-4 w-4 accent-emerald-400"
+                      />
+                      Randomize results
+                    </label>
+                  </div>
+
+                  <div className="mt-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                    <Slider label="US" value={wUS} onChange={setWUS} />
+                    <Slider label="GB" value={wGB} onChange={setWGB} />
+                    <Slider label="CA" value={wCA} onChange={setWCA} />
+                    <Slider label="AU" value={wAU} onChange={setWAU} />
+                  </div>
+
+                  <div className="mt-3 text-xs text-white/50">
+                    Note: if many channels have no country set, they fall into OTHER and are shown less.
+                  </div>
+                </div>
               </div>
             </div>
 
@@ -372,85 +474,45 @@ export default function DashboardPage() {
                 <div className="rounded-3xl border border-white/10 bg-white/5 backdrop-blur-md overflow-hidden">
                   <div className="px-6 py-4 border-b border-white/10 flex items-center justify-between">
                     <div>
-                      <div className="text-lg font-semibold">Results</div>
-                      <div className="text-xs text-white/60">{loading ? "Loading…" : `${rows.length} channels`}</div>
+                      <div className="text-lg font-semibold">Discover Cards</div>
+                      <div className="text-xs text-white/60">
+                        {loading ? "Loading…" : `${rows.length} channels`}
+                      </div>
                     </div>
                     {err && <div className="text-sm text-red-300">{err}</div>}
                   </div>
 
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-sm">
-                      <thead className="text-white/70">
-                        <tr className="border-b border-white/10">
-                          <th className="text-left px-6 py-3">Channel</th>
-                          <th className="text-right px-4 py-3">Subs</th>
-                          <th className="text-right px-4 py-3">Total Views</th>
-                          <th className="text-right px-4 py-3">Videos</th>
-                          <th className="text-right px-4 py-3">Recent AVG</th>
-                          <th className="text-right px-4 py-3">Recent Count</th>
-                          <th className="text-right px-4 py-3">Ratio</th>
-                          <th className="text-left px-6 py-3">First Upload</th>
-                          <th className="text-right px-6 py-3">Save</th>
-                        </tr>
-                      </thead>
-
-                      <tbody className="text-white/90">
+                  <div className="p-6">
+                    {loading ? (
+                      <CardSkeletonGrid />
+                    ) : rows.length === 0 ? (
+                      <div className="px-6 py-10 text-center text-white/60">
+                        No channels match your filters. If you want data immediately: click Live Refresh.
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
                         {rows.map((r) => {
-                          const m = r.channel_metrics || {};
-                          const ratio = typeof m.ratio_views_per_sub === "number" ? m.ratio_views_per_sub : null;
+                          const m = Array.isArray(r.channel_metrics) ? r.channel_metrics[0] : r.channel_metrics;
+                          const ratio = typeof m?.ratio_views_per_sub === "number" ? m.ratio_views_per_sub : null;
                           const saved = savedIds.has(r.channel_id);
 
                           return (
-                            <tr key={r.channel_id} className="border-b border-white/5 hover:bg-white/5 transition">
-                              <td className="px-6 py-4">
-                                <div className="font-semibold">{r.title}</div>
-                                <div className="text-xs text-white/50">{r.channel_id}</div>
-                              </td>
-                              <td className="px-4 py-4 text-right">{fmt(r.subscriber_count)}</td>
-                              <td className="px-4 py-4 text-right">{fmt(r.view_count)}</td>
-                              <td className="px-4 py-4 text-right">{fmt(r.video_count)}</td>
-                              <td className="px-4 py-4 text-right">{fmt(m.recent_avg_views)}</td>
-                              <td className="px-4 py-4 text-right">{fmt(m.recent_short_count)}</td>
-                              <td className="px-4 py-4 text-right">
-                                {ratio === null ? (
-                                  "-"
-                                ) : (
-                                  <span className="inline-flex items-center rounded-full border border-emerald-400/25 bg-emerald-400/10 px-2 py-1 text-xs font-semibold text-emerald-200
-                                                   shadow-[0_0_18px_rgba(34,255,170,0.18)]">
-                                    {ratio.toFixed(4)}
-                                  </span>
-                                )}
-                              </td>
-                              <td className="px-6 py-4">{r.first_upload_at ? new Date(r.first_upload_at).toISOString().slice(0, 10) : "-"}</td>
-                              <td className="px-6 py-4 text-right">
-                                <button
-                                  onClick={() => toggleSave(r.channel_id)}
-                                  className={`rounded-xl px-3 py-2 text-xs font-semibold border transition ${
-                                    saved
-                                      ? "border-emerald-400/30 bg-emerald-400/10 shadow-[0_0_18px_rgba(34,255,170,0.16)]"
-                                      : "border-white/10 bg-white/5 hover:bg-white/10"
-                                  }`}
-                                >
-                                  {saved ? "Saved" : "Save"}
-                                </button>
-                              </td>
-                            </tr>
+                            <ChannelCard
+                              key={r.channel_id}
+                              r={r}
+                              m={m}
+                              ratio={ratio}
+                              saved={saved}
+                              onToggleSave={() => toggleSave(r.channel_id)}
+                            />
                           );
                         })}
-
-                        {!loading && rows.length === 0 && (
-                          <tr>
-                            <td colSpan={9} className="px-6 py-10 text-center text-white/60">
-                              No channels match your filters. Widen ranges and try again.
-                            </td>
-                          </tr>
-                        )}
-                      </tbody>
-                    </table>
+                      </div>
+                    )}
                   </div>
 
-                  <div className="px-6 py-4 text-xs text-white/50">
-                    Live Refresh pulls the latest Shorts (10–40s) from YouTube first, then applies your filters.
+                  <div className="px-6 py-4 text-xs text-white/50 border-t border-white/10">
+                    Cards animate + glow on hover. Use sliders to bias region mix.
                   </div>
                 </div>
               )}
@@ -463,7 +525,7 @@ export default function DashboardPage() {
               <div className="px-6 py-5 border-b border-white/10 flex items-center justify-between">
                 <div>
                   <div className="text-xl font-semibold">Saved Channels</div>
-                  <div className="text-sm text-white/60">Your shortlist across sessions.</div>
+                  <div className="text-sm text-white/60">Private to your account.</div>
                 </div>
 
                 <button
@@ -476,75 +538,39 @@ export default function DashboardPage() {
 
               {savedErr && <div className="px-6 py-4 text-sm text-red-300">{savedErr}</div>}
 
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm">
-                  <thead className="text-white/70">
-                    <tr className="border-b border-white/10">
-                      <th className="text-left px-6 py-3">Channel</th>
-                      <th className="text-right px-4 py-3">Subs</th>
-                      <th className="text-right px-4 py-3">Total Views</th>
-                      <th className="text-right px-4 py-3">Videos</th>
-                      <th className="text-right px-4 py-3">Recent AVG</th>
-                      <th className="text-right px-4 py-3">Recent Count</th>
-                      <th className="text-right px-4 py-3">Ratio</th>
-                      <th className="text-left px-6 py-3">First Upload</th>
-                      <th className="text-right px-6 py-3">Remove</th>
-                    </tr>
-                  </thead>
-
-                  <tbody className="text-white/90">
+              <div className="p-6">
+                {savedLoading ? (
+                  <CardSkeletonGrid />
+                ) : savedRows.length === 0 ? (
+                  <div className="px-6 py-10 text-center text-white/60">
+                    No saved channels yet. Go to Discover and click “Save”.
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
                     {savedRows.map((r) => {
-                      const m = (r.channel_metrics && r.channel_metrics[0]) ? r.channel_metrics[0] : (r.channel_metrics || {});
+                      const m = Array.isArray(r.channel_metrics) ? r.channel_metrics[0] : r.channel_metrics;
                       const ratio = typeof m?.ratio_views_per_sub === "number" ? m.ratio_views_per_sub : null;
 
                       return (
-                        <tr key={r.channel_id} className="border-b border-white/5 hover:bg-white/5 transition">
-                          <td className="px-6 py-4">
-                            <div className="font-semibold">{r.title}</div>
-                            <div className="text-xs text-white/50">{r.channel_id}</div>
-                          </td>
-                          <td className="px-4 py-4 text-right">{fmt(r.subscriber_count)}</td>
-                          <td className="px-4 py-4 text-right">{fmt(r.view_count)}</td>
-                          <td className="px-4 py-4 text-right">{fmt(r.video_count)}</td>
-                          <td className="px-4 py-4 text-right">{fmt(m?.recent_avg_views)}</td>
-                          <td className="px-4 py-4 text-right">{fmt(m?.recent_short_count)}</td>
-                          <td className="px-4 py-4 text-right">
-                            {ratio === null ? "-" : (
-                              <span className="inline-flex items-center rounded-full border border-emerald-400/25 bg-emerald-400/10 px-2 py-1 text-xs font-semibold text-emerald-200
-                                               shadow-[0_0_18px_rgba(34,255,170,0.18)]">
-                                {ratio.toFixed(4)}
-                              </span>
-                            )}
-                          </td>
-                          <td className="px-6 py-4">{r.first_upload_at ? new Date(r.first_upload_at).toISOString().slice(0, 10) : "-"}</td>
-                          <td className="px-6 py-4 text-right">
-                            <button
-                              onClick={async () => {
-                                await toggleSave(r.channel_id);
-                                await loadSavedList();
-                              }}
-                              className="rounded-xl px-3 py-2 text-xs font-semibold border border-white/10 bg-white/5 hover:bg-white/10 transition"
-                            >
-                              Remove
-                            </button>
-                          </td>
-                        </tr>
+                        <ChannelCard
+                          key={r.channel_id}
+                          r={r}
+                          m={m}
+                          ratio={ratio}
+                          saved={true}
+                          onToggleSave={async () => {
+                            await toggleSave(r.channel_id);
+                            await loadSavedList();
+                          }}
+                        />
                       );
                     })}
-
-                    {!savedLoading && savedRows.length === 0 && (
-                      <tr>
-                        <td colSpan={9} className="px-6 py-10 text-center text-white/60">
-                          No saved channels yet. Go to Discover and click “Save”.
-                        </td>
-                      </tr>
-                    )}
-                  </tbody>
-                </table>
+                  </div>
+                )}
               </div>
 
-              <div className="px-6 py-4 text-xs text-white/50">
-                Saved channels are private to your account (RLS enabled).
+              <div className="px-6 py-4 text-xs text-white/50 border-t border-white/10">
+                Saved list is protected by Supabase RLS.
               </div>
             </div>
           </>
@@ -554,14 +580,38 @@ export default function DashboardPage() {
   );
 }
 
+/* ---------- UI Components ---------- */
+
+function SelectBox(props: {
+  title: string;
+  value: SortKey;
+  onChange: (v: SortKey) => void;
+  col: string;
+  includeNone?: boolean;
+}) {
+  return (
+    <div className={`${props.col}`}>
+      <label className="text-xs text-white/70">{props.title}</label>
+      <select
+        value={props.value}
+        onChange={(e) => props.onChange(e.target.value as SortKey)}
+        className="mt-2 w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-[rgba(34,255,170,0.55)] shadow-[0_0_18px_rgba(34,255,170,0.08)]"
+      >
+        {props.includeNone && <option value="none" className="bg-[#0b0d14]">No secondary sort</option>}
+        {SORTS.map((s) => (
+          <option key={s.value} value={s.value} className="bg-[#0b0d14]">{s.label}</option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
 function EmptyState() {
   return (
     <div className="rounded-3xl border border-white/10 bg-white/5 backdrop-blur-md p-10 text-center">
       <div className="mx-auto h-14 w-14 rounded-2xl bg-[radial-gradient(circle_at_30%_30%,rgba(34,255,170,0.85),rgba(139,92,246,0.65))] shadow-[0_0_30px_rgba(34,255,170,0.25)] animate-pulse" />
       <div className="mt-4 text-xl font-semibold">Apply Filters to view channels</div>
-      <div className="mt-1 text-sm text-white/60">
-        Set your ranges and sorting, then click <span className="text-white/90 font-semibold">Apply Filters</span>.
-      </div>
+      <div className="mt-1 text-sm text-white/60">For fresh results, click Live Refresh.</div>
     </div>
   );
 }
@@ -604,7 +654,6 @@ function RangeBox(props: {
         <div className="text-xs text-white/70">{props.title}</div>
         <div className="text-[11px] text-white/50">{props.hint}</div>
       </div>
-
       <div className="mt-3 grid grid-cols-2 gap-3">
         <div>
           <div className="text-[11px] text-white/60">Min</div>
@@ -612,7 +661,7 @@ function RangeBox(props: {
             type="number"
             value={props.min}
             onChange={(e) => props.setMin(Number(e.target.value))}
-            className="mt-1 w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-[rgba(34,255,170,0.55)] transition"
+            className="mt-1 w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-[rgba(34,255,170,0.55)]"
           />
         </div>
         <div>
@@ -621,10 +670,143 @@ function RangeBox(props: {
             type="number"
             value={props.max}
             onChange={(e) => props.setMax(Number(e.target.value))}
-            className="mt-1 w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-[rgba(34,255,170,0.55)] transition"
+            className="mt-1 w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none focus:border-[rgba(34,255,170,0.55)]"
           />
         </div>
       </div>
+    </div>
+  );
+}
+
+function Slider(props: { label: string; value: number; onChange: (v: number) => void }) {
+  return (
+    <div className="rounded-2xl border border-white/10 bg-black/25 p-4">
+      <div className="flex items-center justify-between">
+        <div className="text-sm font-semibold">{props.label}</div>
+        <div className="text-xs text-white/60">{props.value}</div>
+      </div>
+      <input
+        type="range"
+        min={0}
+        max={100}
+        value={props.value}
+        onChange={(e) => props.onChange(Number(e.target.value))}
+        className="mt-3 w-full accent-emerald-400"
+      />
+      <div className="mt-1 text-[11px] text-white/50">0 = none • 100 = max</div>
+    </div>
+  );
+}
+
+function CardSkeletonGrid() {
+  const items = Array.from({ length: 9 }, (_, i) => i);
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
+      {items.map((i) => (
+        <div
+          key={i}
+          className="rounded-3xl border border-white/10 bg-white/5 p-5 overflow-hidden relative"
+        >
+          <div className="absolute inset-0 opacity-35 bg-[linear-gradient(90deg,transparent,rgba(255,255,255,0.10),transparent)] [background-size:200%_100%] animate-[shimmer_1.2s_linear_infinite]" />
+          <div className="h-4 w-2/3 bg-white/10 rounded" />
+          <div className="mt-2 h-3 w-1/2 bg-white/10 rounded" />
+          <div className="mt-6 h-20 bg-white/10 rounded-2xl" />
+          <div className="mt-4 h-9 w-28 bg-white/10 rounded-xl" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ChannelCard(props: {
+  r: any;
+  m: any;
+  ratio: number | null;
+  saved: boolean;
+  onToggleSave: () => void;
+}) {
+  const { r, m, ratio, saved, onToggleSave } = props;
+
+  const firstUpload = r.first_upload_at ? new Date(r.first_upload_at).toISOString().slice(0, 10) : "-";
+  const region = (r.country || "OTHER").toUpperCase();
+
+  return (
+    <div
+      className="group rounded-3xl border border-white/10 bg-white/5 backdrop-blur-md p-5
+                 shadow-[0_0_40px_rgba(34,255,170,0.06)]
+                 hover:shadow-[0_0_60px_rgba(34,255,170,0.14)]
+                 transition transform hover:-translate-y-1"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <div className="text-base font-semibold leading-snug line-clamp-2">{r.title || "Untitled channel"}</div>
+          <div className="mt-1 text-xs text-white/55">{r.channel_id}</div>
+        </div>
+
+        <span
+          className="shrink-0 inline-flex items-center rounded-full border border-emerald-400/25 bg-emerald-400/10
+                     px-2 py-1 text-[11px] font-semibold text-emerald-200
+                     shadow-[0_0_18px_rgba(34,255,170,0.14)]"
+        >
+          {region}
+        </span>
+      </div>
+
+      <div className="mt-4 grid grid-cols-2 gap-3">
+        <Stat label="Subs" value={fmt(r.subscriber_count)} />
+        <Stat label="Total Views" value={fmt(r.view_count)} />
+        <Stat label="Videos" value={fmt(r.video_count)} />
+        <Stat label="First Upload" value={firstUpload} />
+      </div>
+
+      <div className="mt-4 rounded-2xl border border-white/10 bg-black/25 p-4">
+        <div className="flex items-center justify-between">
+          <div className="text-xs text-white/60">Recent AVG (14d)</div>
+          <div className="text-sm font-semibold">{fmt(m?.recent_avg_views)}</div>
+        </div>
+
+        <div className="mt-2 flex items-center justify-between">
+          <div className="text-xs text-white/60">Recent Shorts Count</div>
+          <div className="text-sm font-semibold">{fmt(m?.recent_short_count)}</div>
+        </div>
+
+        <div className="mt-2 flex items-center justify-between">
+          <div className="text-xs text-white/60">Ratio</div>
+          {ratio === null ? (
+            <div className="text-sm font-semibold text-white/60">-</div>
+          ) : (
+            <div className="text-sm font-semibold text-emerald-200">
+              {ratio.toFixed(4)}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="mt-4 flex items-center justify-between">
+        <button
+          onClick={onToggleSave}
+          className={`rounded-xl px-3 py-2 text-xs font-semibold border transition ${
+            saved
+              ? "border-emerald-400/30 bg-emerald-400/10 shadow-[0_0_18px_rgba(34,255,170,0.16)]"
+              : "border-white/10 bg-white/5 hover:bg-white/10"
+          }`}
+        >
+          {saved ? "Saved" : "Save"}
+        </button>
+
+        <div className="text-[11px] text-white/45">
+          Hover glow • Neon UI
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Stat(props: { label: string; value: string }) {
+  return (
+    <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
+      <div className="text-[11px] text-white/55">{props.label}</div>
+      <div className="mt-1 text-sm font-semibold">{props.value}</div>
     </div>
   );
 }
