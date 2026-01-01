@@ -1,18 +1,29 @@
 "use client";
 
-import { useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { supabaseBrowser } from "@/lib/supabaseBrowser";
 
 export default function LoginPage() {
   const router = useRouter();
-  const params = useSearchParams();
-  const next = params.get("next") || "/dashboard";
 
+  const [nextPath, setNextPath] = useState("/dashboard");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+
   const [msg, setMsg] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+
+  // Read ?next=... ONLY on client to avoid prerender errors
+  useEffect(() => {
+    try {
+      const url = new URL(window.location.href);
+      const next = url.searchParams.get("next");
+      if (next && next.startsWith("/")) setNextPath(next);
+    } catch {
+      // ignore
+    }
+  }, []);
 
   async function signIn(e: React.FormEvent) {
     e.preventDefault();
@@ -20,6 +31,7 @@ export default function LoginPage() {
     setLoading(true);
 
     const { error } = await supabaseBrowser.auth.signInWithPassword({ email, password });
+
     setLoading(false);
 
     if (error) {
@@ -28,13 +40,15 @@ export default function LoginPage() {
     }
 
     router.refresh();
-    router.push(next);
+    router.push(nextPath);
   }
 
   async function signUp() {
     setMsg(null);
     setLoading(true);
+
     const { error } = await supabaseBrowser.auth.signUp({ email, password });
+
     setLoading(false);
 
     if (error) setMsg(error.message);
@@ -64,6 +78,7 @@ export default function LoginPage() {
               placeholder="Email"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
+              autoComplete="email"
             />
             <input
               className="w-full rounded-xl border border-white/10 bg-black/30 px-3 py-3 text-sm outline-none focus:border-[rgba(34,255,170,0.55)]"
@@ -71,6 +86,7 @@ export default function LoginPage() {
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
+              autoComplete="current-password"
             />
 
             <button
@@ -97,7 +113,7 @@ export default function LoginPage() {
           {msg && <p className="mt-4 text-sm text-white/80">{msg}</p>}
 
           <p className="mt-6 text-xs text-white/50">
-            Shorts-only discovery. Filters apply on-demand.
+            Redirect after login: <span className="text-white/70">{nextPath}</span>
           </p>
         </div>
       </div>
