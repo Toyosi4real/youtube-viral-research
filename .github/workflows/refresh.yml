@@ -1,0 +1,20 @@
+name: Refresh Channel Data
+
+on:
+  schedule:
+    - cron: "0 * * * *"  # hourly
+  workflow_dispatch:
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Discover (mostPopular + uploads crawl)
+        run: |
+          curl -sS -X POST "${{ secrets.APP_URL }}/api/discover" \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" > /dev/null
+
+      - name: Compute channel metrics (14 days)
+        run: |
+          curl -sS -X POST "${{ secrets.APP_URL }}/api/compute-metrics" \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" > /dev/null
