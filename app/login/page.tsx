@@ -1,46 +1,106 @@
 "use client";
+
 import { useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { supabaseBrowser } from "@/lib/supabaseBrowser";
 
 export default function LoginPage() {
   const router = useRouter();
+  const params = useSearchParams();
+  const next = params.get("next") || "/dashboard";
+
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [msg, setMsg] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
 
   async function signIn(e: React.FormEvent) {
     e.preventDefault();
     setMsg(null);
+    setLoading(true);
 
     const { error } = await supabaseBrowser.auth.signInWithPassword({ email, password });
+    setLoading(false);
+
     if (error) {
       setMsg(error.message);
       return;
     }
 
-    // cookie is now set; refresh + push so middleware sees it
     router.refresh();
-    router.push("/dashboard");
+    router.push(next);
   }
 
   async function signUp() {
     setMsg(null);
+    setLoading(true);
     const { error } = await supabaseBrowser.auth.signUp({ email, password });
+    setLoading(false);
+
     if (error) setMsg(error.message);
-    else setMsg("Account created. If email confirmation is on, check your inbox, then sign in.");
+    else setMsg("Account created. If email confirmation is ON, confirm email then sign in.");
   }
 
   return (
-    <main style={{ maxWidth: 420, margin: "40px auto", padding: 16 }}>
-      <h1>Sign in</h1>
-      <form onSubmit={signIn}>
-        <input placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} style={{ width: "100%", marginBottom: 10 }} />
-        <input placeholder="Password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} style={{ width: "100%", marginBottom: 10 }} />
-        <button style={{ width: "100%", marginBottom: 8 }} type="submit">Sign in</button>
-        <button style={{ width: "100%" }} type="button" onClick={signUp}>Create account</button>
-      </form>
-      {msg && <p style={{ marginTop: 12 }}>{msg}</p>}
+    <main className="min-h-screen text-white">
+      <div className="fixed inset-0 -z-10 bg-[#05060a]">
+        <div className="absolute inset-0 opacity-70 bg-[radial-gradient(ellipse_at_top,_rgba(34,255,170,0.18),_transparent_55%),radial-gradient(ellipse_at_bottom,_rgba(139,92,246,0.18),_transparent_55%)]" />
+        <div className="absolute inset-0 opacity-35 bg-[linear-gradient(to_right,rgba(34,255,170,0.08),transparent_35%,rgba(139,92,246,0.08))]" />
+      </div>
+
+      <div className="mx-auto max-w-md px-4 pt-24">
+        <div className="rounded-3xl border border-white/10 bg-white/5 backdrop-blur-md p-6 shadow-[0_0_60px_rgba(34,255,170,0.08)]">
+          <div className="flex items-center gap-3">
+            <div className="h-10 w-10 rounded-xl bg-[radial-gradient(circle_at_30%_30%,rgba(34,255,170,0.9),rgba(139,92,246,0.7))] shadow-[0_0_24px_rgba(34,255,170,0.25)] animate-pulse" />
+            <div>
+              <div className="text-xl font-semibold">ViewHunt</div>
+              <div className="text-xs text-white/60">Sign in to continue</div>
+            </div>
+          </div>
+
+          <form onSubmit={signIn} className="mt-6 space-y-3">
+            <input
+              className="w-full rounded-xl border border-white/10 bg-black/30 px-3 py-3 text-sm outline-none focus:border-[rgba(34,255,170,0.55)]"
+              placeholder="Email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+            />
+            <input
+              className="w-full rounded-xl border border-white/10 bg-black/30 px-3 py-3 text-sm outline-none focus:border-[rgba(34,255,170,0.55)]"
+              placeholder="Password"
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+
+            <button
+              disabled={loading}
+              className="w-full rounded-2xl px-4 py-3 text-sm font-semibold
+                         bg-[linear-gradient(135deg,rgba(34,255,170,0.25),rgba(139,92,246,0.25))]
+                         border border-white/15 hover:border-white/25 transition
+                         shadow-[0_0_24px_rgba(34,255,170,0.18)] disabled:opacity-60"
+              type="submit"
+            >
+              {loading ? "Signing in..." : "Sign in"}
+            </button>
+
+            <button
+              disabled={loading}
+              className="w-full rounded-2xl px-4 py-3 text-sm font-semibold border border-white/10 bg-white/5 hover:bg-white/10 transition disabled:opacity-60"
+              type="button"
+              onClick={signUp}
+            >
+              Create account
+            </button>
+          </form>
+
+          {msg && <p className="mt-4 text-sm text-white/80">{msg}</p>}
+
+          <p className="mt-6 text-xs text-white/50">
+            Shorts-only discovery. Filters apply on-demand.
+          </p>
+        </div>
+      </div>
     </main>
   );
 }

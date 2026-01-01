@@ -9,33 +9,41 @@ export async function middleware(req: NextRequest) {
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
     {
       cookies: {
-        getAll: () => req.cookies.getAll(),
-        setAll: (cookiesToSet) => cookiesToSet.forEach(({ name, value, options }) => res.cookies.set(name, value, options)),
+        getAll() {
+          return req.cookies.getAll();
+        },
+        setAll(cookiesToSet) {
+          cookiesToSet.forEach(({ name, value, options }) => {
+            res.cookies.set(name, value, options);
+          });
+        },
       },
     }
   );
 
   const { data } = await supabase.auth.getUser();
-  const loggedIn = !!data.user;
-  const p = req.nextUrl.pathname;
 
-  if (p.startsWith("/dashboard") && !loggedIn) {
-    const u = req.nextUrl.clone();
-    u.pathname = "/login";
-    return NextResponse.redirect(u);
+  const isAuthed = !!data.user;
+  const path = req.nextUrl.pathname;
+
+  // Redirect unauthenticated users to /login
+  if (!isAuthed && (path.startsWith("/dashboard") || path.startsWith("/api/channels"))) {
+    const url = req.nextUrl.clone();
+    url.pathname = "/login";
+    url.searchParams.set("next", path);
+    return NextResponse.redirect(url);
   }
 
-  if (p.startsWith("/api/channels") && !loggedIn) {
-    return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
-  }
-
-  if (p.startsWith("/login") && loggedIn) {
-    const u = req.nextUrl.clone();
-    u.pathname = "/dashboard";
-    return NextResponse.redirect(u);
+  // If authed and visiting /login, go to dashboard
+  if (isAuthed && path === "/login") {
+    const url = req.nextUrl.clone();
+    url.pathname = "/dashboard";
+    return NextResponse.redirect(url);
   }
 
   return res;
 }
 
-export const config = { matcher: ["/dashboard/:path*", "/login", "/api/channels"] };
+export const config = {
+  matcher: ["/dashboard/:path*", "/api/channels/:path*", "/login"],
+};

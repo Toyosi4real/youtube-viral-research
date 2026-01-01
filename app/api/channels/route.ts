@@ -13,17 +13,17 @@ type SortKey =
 function applySort(q: any, sort: SortKey) {
   switch (sort) {
     case "bestRatio":
-      return q.order("ratio_views_per_sub", { ascending: false, nullsFirst: false, foreignTable: "channel_metrics" });
+      return q.order("ratio_views_per_sub", { ascending: false, foreignTable: "channel_metrics" });
     case "worstRatio":
-      return q.order("ratio_views_per_sub", { ascending: true, nullsFirst: false, foreignTable: "channel_metrics" });
+      return q.order("ratio_views_per_sub", { ascending: true, foreignTable: "channel_metrics" });
 
     case "bestAvg":
-      return q.order("recent_avg_views", { ascending: false, nullsFirst: false, foreignTable: "channel_metrics" });
+      return q.order("recent_avg_views", { ascending: false, foreignTable: "channel_metrics" });
     case "worstAvg":
-      return q.order("recent_avg_views", { ascending: true, nullsFirst: false, foreignTable: "channel_metrics" });
+      return q.order("recent_avg_views", { ascending: true, foreignTable: "channel_metrics" });
 
     case "mostViews":
-      return q.order("view_count", { ascending: false }); // total channel views
+      return q.order("view_count", { ascending: false });
     case "leastViews":
       return q.order("view_count", { ascending: true });
 
@@ -37,11 +37,10 @@ function applySort(q: any, sort: SortKey) {
     case "leastVideos":
       return q.order("video_count", { ascending: true });
 
-    // newest/oldest by FIRST UPLOAD (based on Shorts ingested)
     case "newestFirst":
-      return q.order("first_upload_at", { ascending: false, nullsFirst: false });
+      return q.order("first_upload_at", { ascending: false });
     case "oldestFirst":
-      return q.order("first_upload_at", { ascending: true, nullsFirst: false });
+      return q.order("first_upload_at", { ascending: true });
 
     default:
       return q;
@@ -50,6 +49,27 @@ function applySort(q: any, sort: SortKey) {
 
 export async function GET(req: Request) {
   const url = new URL(req.url);
+
+  // if refresh=1, do live refresh first (server-side)
+  const refresh = url.searchParams.get("refresh") === "1";
+  if (refresh) {
+    const origin = url.origin;
+
+    // Trigger discover + compute using server secret (not exposed)
+    const h = { "x-cron-secret": process.env.CRON_SECRET! };
+
+    const d = await fetch(`${origin}/api/discover`, { method: "POST", headers: h, cache: "no-store" });
+    const dj = await d.json().catch(() => ({}));
+    if (!dj.ok) {
+      return NextResponse.json({ ok: false, error: dj.error || "Discover failed" }, { status: 400 });
+    }
+
+    const m = await fetch(`${origin}/api/compute-metrics`, { method: "POST", headers: h, cache: "no-store" });
+    const mj = await m.json().catch(() => ({}));
+    if (!mj.ok) {
+      return NextResponse.json({ ok: false, error: mj.error || "Metrics failed" }, { status: 400 });
+    }
+  }
 
   const primarySort = (url.searchParams.get("primarySort") || "bestRatio") as SortKey;
   const secondarySort = (url.searchParams.get("secondarySort") || "none") as SortKey;
@@ -66,6 +86,8 @@ export async function GET(req: Request) {
   const minVideos = Number(url.searchParams.get("minVideos") || 0);
   const maxVideos = Number(url.searchParams.get("maxVideos") || 1000);
 
+  const searchTitle = (url.searchParams.get("searchTitle") || "").trim();
+
   let q = supabaseAdmin
     .from("channels")
     .select(`
@@ -73,17 +95,17 @@ export async function GET(req: Request) {
       channel_metrics!inner(recent_days,recent_short_count,recent_avg_views,recent_total_views,ratio_views_per_sub,computed_at)
     `);
 
-  // sliders
+  // filters
   q = q.gte("subscriber_count", minSubs).lte("subscriber_count", maxSubs);
   q = q.gte("video_count", minVideos).lte("video_count", maxVideos);
-  q = q.gte("channel_metrics.recent_avg_views", minRecentAvg)
-       .lte("channel_metrics.recent_avg_views", maxRecentAvg);
+  q = q.gte("channel_metrics.recent_avg_views", minRecentAvg).lte("channel_metrics.recent_avg_views", maxRecentAvg);
 
-  // checkboxes
   if (enhancedOnly) q = q.not("channel_metrics.recent_avg_views", "is", null);
   if (activeRecently) q = q.gte("channel_metrics.recent_short_count", 4);
 
-  // primary + optional secondary sort
+  if (searchTitle) q = q.ilike("title", `%${searchTitle}%`);
+
+  // sorts
   q = applySort(q, primarySort);
   if (secondarySort !== "none") q = applySort(q, secondarySort);
 

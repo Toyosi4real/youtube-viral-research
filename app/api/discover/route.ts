@@ -14,6 +14,10 @@ const MOST_POPULAR_PER_REGION = 25;
 const MAX_CHANNELS_TO_CRAWL_PER_RUN = 80;
 const UPLOADS_TO_FETCH_PER_CHANNEL = 25;
 
+// Shorts length constraint
+const MIN_SHORT_SECONDS = 10;
+const MAX_SHORT_SECONDS = 40;
+
 function chunk<T>(arr: T[], size: number) {
   const out: T[][] = [];
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
@@ -24,8 +28,9 @@ export async function POST(req: Request) {
   try {
     assertCron(req);
 
-    // 1) Seed channels from mostPopular
+    // 1) seed channels from mostPopular
     const discoveredChannelIds: string[] = [];
+
     for (const regionCode of REGIONS) {
       const popular = await ytGet("videos", {
         part: "snippet",
@@ -45,7 +50,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: true, crawledChannels: 0, shortsUpserted: 0 });
     }
 
-    // 2) Fetch channel details (includes uploads playlist + stats)
+    // 2) fetch channel details (uploads playlist + stats)
     const channelDetails: any[] = [];
     for (const ids of chunk(uniqueChannelIds, 50)) {
       const c = await ytGet("channels", {
@@ -55,7 +60,6 @@ export async function POST(req: Request) {
       for (const item of c.items || []) channelDetails.push(item);
     }
 
-    // Upsert channels with real stats
     const channelRows = channelDetails.map((ch: any) => ({
       channel_id: ch.id,
       title: ch.snippet?.title ?? null,
@@ -81,7 +85,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // 3) Crawl uploads playlist and ingest latest Shorts
+    // 3) crawl uploads playlist and ingest SHORTS only (10–40s)
     let totalShortsUpserted = 0;
     let channelsCrawled = 0;
 
@@ -100,7 +104,6 @@ export async function POST(req: Request) {
       const videoIds = Array.from(
         new Set((pl.items || []).map((x: any) => x.contentDetails?.videoId).filter(Boolean))
       );
-
       if (!videoIds.length) continue;
 
       for (const ids of chunk(videoIds, 50)) {
@@ -112,7 +115,7 @@ export async function POST(req: Request) {
         const shortRows = (v.items || [])
           .map((it: any) => {
             const dur = isoDurationToSeconds(it.contentDetails?.duration ?? "PT0S");
-            const isShort = dur > 0 && dur <= 60;
+            const isShort = dur >= MIN_SHORT_SECONDS && dur <= MAX_SHORT_SECONDS;
             if (!isShort) return null;
 
             return {
@@ -148,7 +151,12 @@ export async function POST(req: Request) {
       }
     }
 
-    return NextResponse.json({ ok: true, crawledChannels: channelsCrawled, shortsUpserted: totalShortsUpserted });
+    return NextResponse.json({
+      ok: true,
+      crawledChannels: channelsCrawled,
+      shortsUpserted: totalShortsUpserted,
+      shortSeconds: `${MIN_SHORT_SECONDS}-${MAX_SHORT_SECONDS}`,
+    });
   } catch (e: any) {
     return NextResponse.json({ ok: false, error: e.message }, { status: 400 });
   }
